@@ -1,0 +1,988 @@
+---
+title: "241102_ProteomicsModels"
+author: "Albert Groenendijk"
+date: "2024-11-02"
+output: html_document
+---
+
+Load libraries
+```{r}
+library(tidyverse)
+library(survival)
+library(ggplot2)
+library(riskRegression) # for time-dependent AUC calculation
+library(randomForestSRC)
+library(glmnet) # also loaded as part of riskRegression when you call GLMnet()
+library(gbm)
+```
+
+Define directories
+```{r}
+inputdir <- "HIV_controllers_ATHENA/AthenaOlinkClinicalCombined_ClinicalPredictionModels/Input/"
+scriptsdir <- "HIV_controllers_ATHENA/AthenaOlinkClinicalCombined_ClinicalPredictionModels/Scripts/"
+outputdir <- "HIV_controllers_ATHENA/AthenaOlinkClinicalCombined_ClinicalPredictionModels/Output/"
+```
+
+Define generic objects
+```{r}
+`%notin%` <- Negate(`%in%`)
+```
+
+Set random seed
+```{r}
+set.seed(101)
+```
+
+Load datasets
+```{r}
+train <- list(
+  VL4K = readRDS(paste0(outputdir,"proteomics_VL4K_train.rds")),
+  HYBRID = readRDS(paste0(outputdir,"proteomics_HYBRID_train.rds")),
+  CD4 = readRDS(paste0(outputdir,"proteomics_CD4_train.rds")))
+test <- list(
+  VL4K = readRDS(paste0(outputdir,"proteomics_VL4K_test.rds")),
+  HYBRID = readRDS(paste0(outputdir,"proteomics_HYBRID_test.rds")),
+  CD4 = readRDS(paste0(outputdir,"proteomics_CD4_test.rds")))
+
+featurelist_olink <- readRDS(paste0(outputdir, "featurelist_olink.rds"))
+```
+
+# Define the clinical and proteomic predictors
+
+Clinical predictors are prefilterd to be only the 4 most important ones:
+
+- Log10Vl
+- baseCD4sqrt
+- MALESEX
+- AGE
+
+For the proteomic predictors, every dataframe only contains proteins with P <0.05.
+
+Make a proteomic selection with the main proteins that are reported in Figure 3C-F in the paper.
+```{r}
+do_not_consider <- c("SMOKING_NEVER",
+                     "baseHCVever","baseHBVever","baseHBV","baseHCV",
+                     "baseBMI","time_since_2000",
+                     "IDU", "ORIGIN_NONWESTERN")
+clinicalpredictors <- c("baseVL_log10", "baseCD4_sqrt", "MALESEX", "AGE")
+proteomic_selection <- c("ICAM3", "CD6", "LY9", "CRTAM",
+                         "SH2D1A",  "C1QL2",  "CNGB3")
+shared_proteins <- Reduce(rbind, featurelist_olink)  %>%
+  group_by(PROTEIN) %>%
+  filter(n() == 3) %>%
+  ungroup() %>% pull(PROTEIN)
+outcomes <- c("VL4K", "HYBRID", "CD4")
+
+# Filter the columns and change factorvars to class factor
+factor_vars <- c("MALESEX")
+for (outcome in outcomes){
+  
+  train[[outcome]] <- train[[outcome]] %>% 
+    select(-c(all_of(do_not_consider)))
+  
+  test[[outcome]] <- test[[outcome]] %>% 
+    select(-c(all_of(do_not_consider)))
+  
+  for (var in factor_vars) {
+    train[[outcome]][[var]] <- factor(train[[outcome]][[var]])
+    test[[outcome]][[var]] <- factor(test[[outcome]][[var]],
+      levels = levels(train[[outcome]][[var]]))
+    # Aligns factor levels with training data
+  }
+}
+```
+
+## Optionally, run data integrity checks
+```{r}
+checkdata = T
+
+if (checkdata){
+  # print the dimensions
+  for (i in c(1:3)){
+    print("train dimensions (rows, columns):")
+    print(dim(train[[i]]))
+    print("test dimensions (rows, columns):")
+    print(dim(test[[i]]))
+  }
+  
+  # Check the number with events
+  for (i in c(1:3)){
+    print("train with event:")
+    print(summary.factor(train[[i]]$status))
+    print("test with event:")
+    print(summary.factor(test[[i]]$status))
+  }
+  
+  # Colnames between train and test
+  for (i in c(1:3)){
+    print(paste(outcomes[i], "column check:"))
+    columncheck <- all(names(train[[i]] == names(test[[i]])))
+    print(paste("Are colnames the same between train and test?",columncheck))
+  }
+  
+  # Are all proteins with P<0.05 present?
+  for (i in c(1:3)){
+    inputproteins <- featurelist_olink[[outcomes[i]]] %>% filter(RAW_P < 0.05) %>% pull(PROTEIN) 
+    columnsnotpresent <- inputproteins %notin% colnames(train[[i]])
+    print(paste("No. of missing protein columns:", 
+                sum(columnsnotpresent)))
+  }
+  
+  # Are columns present that should not be there
+  for (i in c(1:3)){
+    columnspresent <- do_not_consider %in% colnames(train[[i]])
+    print(paste("No. of columns that should not be considered:",
+                sum(columnspresent)))
+  }
+  
+  # Are all factors of class 'factor'
+  for (i in c(1:3)){
+    for (var in factor_vars){
+      checkfactorcolumns <- class(train[[1]][[var]]) == "factor"
+      print(paste(var, "is a factor:", checkfactorcolumns))
+    }
+  }
+  
+  # Identify missingness
+  for (i in c(1:3)){
+    na_counts <- sapply(train[[i]], function(x) sum(is.na(x)))
+    if (sum(na_counts) > 1){
+      print("There are missing in train")
+      print(na_counts)
+    }else{ print("No NAs in train") }
+
+    na_counts <- sapply(test[[i]], function(x) sum(is.na(x)))
+    if (sum(na_counts) > 1){
+      print("There are missing in test")
+      print(na_counts)
+    }else{ print("No NAs in test") }
+  }
+}
+```
+
+## Random train-test split to verify
+```{r}
+outcomes <- c("VL4K","HYBRID", "CD4")
+set.seed(123)
+randomtrain <- list()
+randomtest <- list()
+for (outcome in outcomes){
+  fulldata <- rbind(train[[outcome]], test[[outcome]])
+  randomtrain[[outcome]] <- fulldata %>% slice_sample(prop = 0.7)
+  randomtest[[outcome]] <- anti_join(fulldata, randomtrain[[outcome]], by = "ID")
+}
+
+
+```
+
+
+# Train the models
+## simple Cox regression
+
+Cox regression is very sensitive to overfitting. We take here a very small number of variables.
+
+```{r}
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+outcome <- outcomes[1]
+
+
+# Define features
+## All features
+features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+formula_model_medium <- as.formula(paste("Surv(time, status) ~", paste(c(clinicalpredictors, shared_proteins), collapse = " + ")))
+formula_model_small <- as.formula(paste("Surv(time, status) ~", paste(c(clinicalpredictors, proteomic_selection), collapse = " + ")))
+
+# Train the cox model
+## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+if ("CD6" %notin% colnames(train[[outcome]])){
+  dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+}else{
+  dataset_train <- train[[outcome]]
+  dataset_test <- test[[outcome]]
+}
+
+coxmodel <- coxph(formula_model_small, dataset_train, x = TRUE)
+
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+score_result <- Score(list("Cox" = coxmodel),
+        formula = survformula,
+        data = dataset_test,
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+AUC_overtime$outcome <- "outcome"
+print(AUC_overtime)
+
+#--------------------------------------------
+# Redo the model with random train-test split
+#--------------------------------------------
+## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+if ("CD6" %notin% colnames(train[[outcome]])){
+  dataset_randomtrain <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  dataset_randomtest <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+}else{
+  dataset_randomtrain <- train[[outcome]]
+  dataset_randomtest <- test[[outcome]]
+}
+
+coxmodel <- coxph(formula_model_small, dataset_randomtrain, x = TRUE)
+
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+score_result <- Score(list("Cox" = coxmodel),
+        formula = survformula,
+        data = dataset_randomtest,
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+AUC_overtime$outcome <- "outcome"
+print(AUC_overtime)
+```
+
+## Elastic net cox regression
+
+This is less sensitive to noise & overfitting.
+alpha = 1 for lasso, alpha = 0 for ridge
+
+Ridge (L2), alpha = 0: Useful when you suspect all variables may be relevant but need regularization.
+Lasso (L1), alpha = 1: Helps with feature selection by pushing less informative coefficients to zero, simplifying the model.
+
+
+Test the code
+```{r}
+outcome <- outcomes[1]
+
+# Define the formula
+formula_model_small <- as.formula(paste("Surv(time, status) ~", paste(c(clinicalpredictors, proteomic_selection), collapse = " + ")))
+
+## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+if ("CD6" %notin% colnames(train[[outcome]])){
+  dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+}else{
+  dataset_train <- train[[outcome]]
+  dataset_test <- test[[outcome]]
+}
+
+penalizedmodel_lasso <- GLMnet(formula_model_small, data = dataset_train, alpha = 1, lambda = NULL, cv = TRUE, nfolds = 10, standardize = TRUE)
+```
+
+Find optimal by crossvalidation
+```{r}
+# Define a sequence of alpha values to test
+alpha_values <- seq(0, 1, by = 0.1)  # Adjust step size as needed
+
+# Initialize a data frame to store results
+elasticnet_cvresults <- data.frame(alpha = numeric(), lambda_min = numeric(), cvm_min = numeric(), outcome = character())
+
+for (outcome in outcomes){
+  
+  ## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+  if ("CD6" %notin% colnames(train[[outcome]])){
+    dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+    dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  }else{
+    dataset_train <- train[[outcome]]
+    dataset_test <- test[[outcome]]
+  }
+  
+  # Loop through each alpha value
+  for (alpha in alpha_values) {
+    # Perform cross-validation for each alpha
+    set.seed(123)  # For reproducibility
+    
+    penalizedmodel_balanced <- GLMnet(formula_model_small, data = dataset_train, alpha = alpha, lambda = NULL, cv = TRUE, nfolds = 10, standardize = TRUE)
+  
+    # Store the results: best lambda and corresponding CV error
+    elasticnet_cvresults <- rbind(
+      elasticnet_cvresults, 
+      data.frame(alpha = alpha,
+                 lambda_min = penalizedmodel_balanced$fit$lambda.min,
+                 cvm_min = min(penalizedmodel_balanced$fit$cvm),
+                 outcome = outcome))
+  }
+}
+elasticnet_cvresults
+
+# Find the optimal alpha based on minimum CV error
+optimal_alpha_value <- elasticnet_cvresults %>% group_by(outcome) %>% filter(cvm_min == min(cvm_min)) %>% select(alpha, outcome) %>%  pull(alpha, outcome)
+
+print(paste0('optimal alpha for glmnet: ',optimal_alpha_value))
+```
+
+Try both prefiltered features and full featurelist
+```{r}
+outcome <- outcomes[1]
+
+  ## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+  if ("CD6" %notin% colnames(train[[outcome]])){
+    dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+    dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  }else{
+    dataset_train <- train[[outcome]]
+    dataset_test <- test[[outcome]]
+  }
+
+penalizedmodel_lasso <- GLMnet(formula_model_small, data = dataset_train, alpha = 0, lambda = NULL, cv = TRUE, nfolds = 10, standardize = TRUE)
+
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+score_result <- Score(list("Penalized" = penalizedmodel_lasso),
+        formula = survformula,
+        data = dataset_test,
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+
+features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+
+penalizedmodel_lasso <- GLMnet(formula_model, data = dataset_train, alpha = 1, lambda = NULL, cv = TRUE, nfolds = 10, standardize = TRUE)
+
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+score_result <- Score(list("Penalized" = penalizedmodel_lasso),
+        formula = survformula,
+        data = dataset_test,
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+
+## Gradient boosted machines
+
+The disadvantage of using gbm() with Score() is that the formula in gbm() must be typed statically, which is very long in this case.
+```{r}
+outcome <- outcomes[1]
+
+features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+
+formula_model
+formula_model_small
+
+## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+if ("CD6" %notin% colnames(train[[outcome]])){
+  dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+}else{
+  dataset_train <- train[[outcome]]
+  dataset_test <- test[[outcome]]
+}
+
+# Fit a GBM model with survival data
+gbm_model <- gbm(
+    formula = Surv(time, status) ~ 
+    MALESEX + baseVL_log10 + AGE + baseCD4_sqrt + 
+    GZMH + ITGB1BP2 + ADH4 + EPHX2 + ADAMTS16 + CA5A + ACOX1 + 
+    MCFD2 + FCRL1 + ADGRG2 + ROR1 + CA13 + CCDC80 + SFTPD + PRKAR1A + 
+    CDHR5 + IL6ST + GDF2 + NTRK2 + LGALS1 + CDH6 + ADAMTS13 + 
+    ICAM3 + SELE + CCN3 + LILRB2 + ITGB2 + AMY2A + SEMA7A + XG + 
+    ADGRE5 + PDGFRB + NCAM1 + OSMR + RARRES2 + NRP1 + ADA2 + 
+    IGFBP3 + DPP4 + HSPG2 + ENAH + IL17A + IL5 + IL12RB1 + MICB_MICA + 
+    BID + SCRN1 + PTH1R + ANXA11 + SLAMF7 + IL32 + RAB6A + ITGA6 + 
+    FCRL6 + SULT2A1 + SH2D1A + KLRB1 + PRDX5 + KLRD1 + CD79B + 
+    FCRL2 + ADAM23 + CD40LG + IDS + GZMA + CD6 + CD160 + LY9 + 
+    MZB1 + ENPP5 + CD58 + HSPA1A + CD48 + CCL4 + CXCL10 + CCL17 + 
+    CXCL9 + TNFRSF13B + CXCL3 + CCL24 + LGALS9 + CD276 + MEGF10 + 
+    ADGRE2 + CCL22 + PRELP + CA11 + ADCYAP1R1 + NTF4 + NPTN + 
+    GFER + NAMPT + SUGT1 + FCGR2B + GSTA3 + LTBP3 + FCRLB + RAD23B + 
+    PSRC1 + HGS + ABL1 + TBC1D23 + MPI + GFRA2 + CALB1 + CDKN1A + 
+    KAZALD1 + IGF1R + CDNF + KLK13 + USO1 + RBP5 + VAT1 + CDKN2D + 
+    CD207 + DDAH1 + LAG3 + CBLN4 + PDCD1 + RTN4R + FXN + ITGB7 + 
+    CD5 + PRDX6 + METAP2 + ITGAV + CLMP + DAB2 + CD27 + PPY + 
+    C4BPB + ATOX1 + FGFBP1 + ITGB5 + KLB + TST + C19orf12 + CRADD + 
+    PPP3R1 + ABHD14B + TNFRSF9 + FLRT2 + ASGR1 + GGT5 + ADAM22 + 
+    CRTAM + CHMP1A + FKBP4 + ROBO2 + SCARF2 + LAMP2 + CD8A + 
+    CXCL13 + TNFRSF8 + THY1 + CTSS + NTRK3 + SCARA5 + CGA + SPINK5 + 
+    WARS + IL17RA + NCAM2 + CNTN4 + CD99L2 + CD99 + FCRL5 + NOP56 + 
+    EXOSC10 + CSF2 + CD2 + SHD + IGHMBP2 + C1GALT1C1 + SIGLEC8 + 
+    CCER2 + HSBP1 + KHK + NIT1 + GATD3 + ASPN + NIT2 + NGFR + 
+    BPIFB2 + PGD + RAB27B + LCP1 + COL15A1 + PTPRC + POSTN + 
+    LATS1 + TNFSF9 + KLRF1 + PTP4A3 + C1QL2 + AKAP12 + SCGB3A1 + 
+    ADH1B + C1QTNF9 + RIDA + CD72 + GHR + TNFRSF17 + NEXN + C9 + 
+    F10 + AHSG + AMY1A_AMY1B_AMY1C + B2M + SERPINA5 + IGLC2 + 
+    C1R + C1S + ORM1 + C3 + DNLZ + CNGB3 + TMCO5A + ERC2 + CABP2 + 
+    CAMLG + MDM1 + CLGN + EDF1 + RGCC + IDO1 + DSCAM + CDK5RAP3 + 
+    STXBP1 + TSC22D1 + RGS10 + SUOX + LCN15 + DXO + PLXDC2 + 
+    PNLIPRP1 + PLCB2 + KLRK1 + KIAA0319 + PALM2 + GSTT2B + DLG4 + 
+    DHRS4L2 + MINK1 + TXNDC9 + PLSCR3 + VWA5A + LYZL2 + TIGIT + 
+    REG3G + ZNRF4 + AMOTL2 + ACRBP + FAM171B + TADA3 + TARS1 + 
+    CHCHD6 + AP3B1 + IFNAR1 + GPHA2 + NFU1,  # Survival formula
+    data = dataset_train,
+    distribution = "coxph",    # Cox model for survival
+    n.trees = 1000,             # Number of trees
+    interaction.depth = 3,     # Tree depth
+    shrinkage = 0.01,          # Learning rate
+    n.minobsinnode = 15,       # Minimum observations in terminal nodes
+    bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+)
+
+# Use Score function with the GBM survival model
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+score_result <- Score(
+    list("GBM Model" = gbm_model), 
+    formula = survformula,   # Survival formula for Score function
+    data = dataset_test,                        # Original data with survival info
+    times = times,                # Time points to evaluate the survival model
+    metrics = "AUC",                  # Metric for model evaluation
+    summary = "risks"                     # Summary option for integrated Brier score
+)
+
+# Print results
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+
+## RSF model
+Non-parametric machine learning approach.
+
+The rfsrc() function offers many parameters for fine-tuning:
+* mtry: Number of variables randomly selected at each split
+* nodesize: Minimum size of terminal nodes
+* splitrule: Rule used for splitting nodes
+
+```{r}
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+outcome <- outcomes[1]
+
+features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+
+## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+if ("CD6" %notin% colnames(train[[outcome]])){
+  dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+    test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+}else{
+  dataset_train <- train[[outcome]]
+  dataset_test <- test[[outcome]]
+}
+
+rsfmodel <- rfsrc(formula_model, data = dataset_train, ntree = 3000, cv.fold = 10, nodesize = 15, mtry = 4, splitrule = "logrankscore", nsplit = 10)
+
+
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+score_result <- Score(list("RSF" = rsfmodel),
+        formula = survformula,
+        data = dataset_test,
+        metrics = c("auc"),
+        summary = "risks",
+        times = times,
+        plots = "ROC")
+
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+ROC_overtime <- score_result$ROC$plotframe
+ROC_overtime$type <- "test"
+AUCROC_overtime <- list(AUC_overtime = AUC_overtime, ROC_overtime = ROC_overtime)
+print(AUCROC_overtime)
+AUC_overtime <- AUCROC_overtime$ROC_overtime
+
+score_result$ROC$plotframe
+
+
+roc_data_5yr <- subset(score_result$ROC$plotframe, times == 5*365)
+
+
+
+
+# Plot using ggplot2
+ggplot(roc_data_5yr, aes(x = FPR, y = TPR)) +
+  geom_line(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
+  labs(
+    title = "ROC Curve at 5-Year Risk",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal()
+
+
+
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+
+## Display the relevance of each predictor
+
+```{r}
+meandecreaseaccuracy = list()
+
+obtain_meandecreaseaccuracy <- function(outcome){
+  ## Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+  if ("CD6" %notin% colnames(train[[outcome]])){
+    dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+    dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  }else{
+    dataset_train <- train[[outcome]]
+    dataset_test <- test[[outcome]]
+  }
+
+  # train the RSF, random survival forest
+  features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+  formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+  rsfmodel <- rfsrc(formula_model, data = dataset_train, ntree = 3000, cv.fold = 10, nodesize = 15, mtry = 4, splitrule = "logrankscore", nsplit = 10)
+
+importance_df <- tibble(
+  Outcome = outcome,
+  Variable = names(vimp(rsfmodel)$importance),
+  MeanDecreaseAccuracy = vimp(rsfmodel)$importance
+  ) 
+
+meandecreaseaccuracy[[outcome]] <- importance_df
+return(meandecreaseaccuracy)
+}
+
+obtain_meandecreaseaccuracy(outcomes[3])
+
+
+# Make a list of all results
+for (outcome in outcomes){
+  meandecreaseaccuracy <- obtain_meandecreaseaccuracy(outcome)
+}
+
+# Perform cleaning operations on the list
+for (outcome in outcomes){
+  meandecreaseaccuracy[[outcome]] <- meandecreaseaccuracy[[outcome]] %>%
+    mutate(
+      Outcome = factor(
+        Outcome, 
+        levels = c("VL4K", "HYBRID", "CD4"),
+        labels = c("Virological loss", 
+                   ">1000 copies/mL increase", 
+                   "CD4 <500 cells/mm3")))
+}
+
+# Create the ggplot
+var_importance_plot <- function(outcome_index){
+  i <- outcome_index
+  data <- meandecreaseaccuracy[[outcomes[i]]] %>% 
+  arrange(desc(MeanDecreaseAccuracy)) %>% head(20)
+  
+  fillcolor <- c("#5ec962","orange","darkred")[i]
+  g <- ggplot(data, aes(x = reorder(Variable, MeanDecreaseAccuracy, .desc = TRUE), y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = fillcolor, width = 0.5) +
+  coord_flip() +
+  labs(title = "Variable Importance in Random Survival Forest",
+       x = "Variables",
+       y = "Mean Decrease in Accuracy") +
+  theme_bw() +
+  theme(strip.placement = "outside",
+     strip.text = element_text(angle = 0, size = 8),
+     strip.background = element_blank(),
+     axis.text = element_text(size = 8, color = "black"),
+     axis.title.y = element_blank(),
+     axis.title.x = element_text(size = 10),
+     plot.title = element_text(size = 12, face = "bold")) + 
+    
+    annotate("text", x = 5, y = max(data$MeanDecreaseAccuracy), 
+             angle = 90, size = 8 / .pt, vjust = -1,
+             label = meandecreaseaccuracy[[outcomes[i]]]$Outcome[1]) 
+  
+  print(g)
+}
+
+for (i in c(1:length(outcomes))){
+  ggsave(paste0(outputdir, "VariableImportanceRSF_Proteomics_", outcomes[i], ".pdf"),var_importance_plot(i),width = 21/3, height = 29.7/2.75, units = "cm")
+
+}
+```
+
+Define a function for the gbm where the formula is statically typed
+```{r}
+# outcome <- outcomes[1]
+# features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+# formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+# formula_model
+
+obtain_gbmmodel <- function(outcome, dataset_train){
+  # Fit a GBM model with survival data
+  ## Formula for gbm() has to be statically typed
+  if (outcome == "VL4K"){
+    gbm_model <- gbm(
+        formula = Surv(time, status) ~ 
+          MALESEX + baseVL_log10 + AGE + baseCD4_sqrt + 
+          GZMH + ITGB1BP2 + ADH4 + EPHX2 + ADAMTS16 + CA5A + ACOX1 + 
+          MCFD2 + FCRL1 + ADGRG2 + ROR1 + CA13 + CCDC80 + SFTPD + PRKAR1A + 
+          CDHR5 + IL6ST + GDF2 + NTRK2 + LGALS1 + CDH6 + ADAMTS13 + 
+          ICAM3 + SELE + CCN3 + LILRB2 + ITGB2 + AMY2A + SEMA7A + XG + 
+          ADGRE5 + PDGFRB + NCAM1 + OSMR + RARRES2 + NRP1 + ADA2 + 
+          IGFBP3 + DPP4 + HSPG2 + ENAH + IL17A + IL5 + IL12RB1 + MICB_MICA + 
+          BID + SCRN1 + PTH1R + ANXA11 + SLAMF7 + IL32 + RAB6A + ITGA6 + 
+          FCRL6 + SULT2A1 + SH2D1A + KLRB1 + PRDX5 + KLRD1 + CD79B + 
+          FCRL2 + ADAM23 + CD40LG + IDS + GZMA + CD6 + CD160 + LY9 + 
+          MZB1 + ENPP5 + CD58 + HSPA1A + CD48 + CCL4 + CXCL10 + CCL17 + 
+          CXCL9 + TNFRSF13B + CXCL3 + CCL24 + LGALS9 + CD276 + MEGF10 + 
+          ADGRE2 + CCL22 + PRELP + CA11 + ADCYAP1R1 + NTF4 + NPTN + 
+          GFER + NAMPT + SUGT1 + FCGR2B + GSTA3 + LTBP3 + FCRLB + RAD23B + 
+          PSRC1 + HGS + ABL1 + TBC1D23 + MPI + GFRA2 + CALB1 + CDKN1A + 
+          KAZALD1 + IGF1R + CDNF + KLK13 + USO1 + RBP5 + VAT1 + CDKN2D + 
+          CD207 + DDAH1 + LAG3 + CBLN4 + PDCD1 + RTN4R + FXN + ITGB7 + 
+          CD5 + PRDX6 + METAP2 + ITGAV + CLMP + DAB2 + CD27 + PPY + 
+          C4BPB + ATOX1 + FGFBP1 + ITGB5 + KLB + TST + C19orf12 + CRADD + 
+          PPP3R1 + ABHD14B + TNFRSF9 + FLRT2 + ASGR1 + GGT5 + ADAM22 + 
+          CRTAM + CHMP1A + FKBP4 + ROBO2 + SCARF2 + LAMP2 + CD8A + 
+          CXCL13 + TNFRSF8 + THY1 + CTSS + NTRK3 + SCARA5 + CGA + SPINK5 + 
+          WARS + IL17RA + NCAM2 + CNTN4 + CD99L2 + CD99 + FCRL5 + NOP56 + 
+          EXOSC10 + CSF2 + CD2 + SHD + IGHMBP2 + C1GALT1C1 + SIGLEC8 + 
+          CCER2 + HSBP1 + KHK + NIT1 + GATD3 + ASPN + NIT2 + NGFR + 
+          BPIFB2 + PGD + RAB27B + LCP1 + COL15A1 + PTPRC + POSTN + 
+          LATS1 + TNFSF9 + KLRF1 + PTP4A3 + C1QL2 + AKAP12 + SCGB3A1 + 
+          ADH1B + C1QTNF9 + RIDA + CD72 + GHR + TNFRSF17 + NEXN + C9 + 
+          F10 + AHSG + AMY1A_AMY1B_AMY1C + B2M + SERPINA5 + IGLC2 + 
+          C1R + C1S + ORM1 + C3 + DNLZ + CNGB3 + TMCO5A + ERC2 + CABP2 + 
+          CAMLG + MDM1 + CLGN + EDF1 + RGCC + IDO1 + DSCAM + CDK5RAP3 + 
+          STXBP1 + TSC22D1 + RGS10 + SUOX + LCN15 + DXO + PLXDC2 + 
+          PNLIPRP1 + PLCB2 + KLRK1 + KIAA0319 + PALM2 + GSTT2B + DLG4 + 
+          DHRS4L2 + MINK1 + TXNDC9 + PLSCR3 + VWA5A + LYZL2 + TIGIT + 
+          REG3G + ZNRF4 + AMOTL2 + ACRBP + FAM171B + TADA3 + TARS1 + 
+          CHCHD6 + AP3B1 + IFNAR1 + GPHA2 + NFU1,  # Survival formula
+        data = dataset_train,
+        distribution = "coxph",    # Cox model for survival
+        n.trees = 1000,             # Number of trees
+        interaction.depth = 3,     # Tree depth
+        shrinkage = 0.01,          # Learning rate
+        n.minobsinnode = 15,       # Minimum observations in terminal nodes
+        bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+    )
+  }else if (outcome == "HYBRID"){
+    gbm_model <- gbm(
+        formula = Surv(time, status) ~ 
+          MALESEX + baseVL_log10 + AGE + baseCD4_sqrt + 
+          TSLP + GZMH + CTSH + EDIL3 + ZBTB17 + ADAMTS16 + ACOX1 + 
+          PRSS27 + SFTPD + CDHR5 + KITLG + IL6ST + GDF2 + LGALS1 + 
+          IL19 + TNFSF13B + ICAM3 + ITGB2 + PLXNB2 + UMOD + XG + ADGRE5 + 
+          PDGFRB + PRSS2 + IGFBP3 + HSPG2 + NBN + CLEC4A + CD4 + IL5RA + 
+          GZMB + LSP1 + PSPN + SH2D1A + BTN3A2 + KLRB1 + CD244 + KLRD1 + 
+          IL16 + LAMP3 + IL18R1 + CXCL17 + GZMA + CD6 + CD160 + LY9 + 
+          SCGB1A1 + SIGLEC1 + SMOC2 + CD48 + CCL4 + IL1RN + CXCL9 + 
+          ANGPTL4 + LGALS9 + MEGF10 + ADGRE2 + PRELP + ADCYAP1R1 + 
+          UXS1 + DTX3 + GFRA2 + ALPP + LAG3 + PDCD1 + ITGB7 + CD5 + 
+          SMOC1 + PRTG + FGF23 + CD27 + PPY + KLB + IL34 + NDRG1 + 
+          NOS3 + S100A16 + DPEP1 + PPP3R1 + SKAP1 + LY96 + PLA2G10 + 
+          CRTAM + CSF2RA + TNR + EZR + CD8A + CDH15 + SEMA4D + CXCL13 + 
+          CXCL11 + TNFRSF8 + NTRK3 + IL17RA + NCAM2 + GNLY + CD109 + 
+          CNTN4 + NOP56 + EXOSC10 + TPR + ENOX2 + DDA1 + CD2 + LRCH4 + 
+          SNU13 + SART1 + EDEM2 + INPP5D + ANXA2 + ROBO4 + LIPF + ADAMTSL4 + 
+          GIP + RECK + AAMDC + ASPN + TCOF1 + TIMP2 + CPXM2 + BPIFB2 + 
+          TPK1 + LCP1 + COL3A1 + PTPRC + POSTN + ITGAL + ZBP1 + TNFSF9 + 
+          KLRF1 + NECTIN1 + C1QL2 + SCGB3A1 + DIPK2B + MXRA8 + GIMAP7 + 
+          KLK7 + RLN2 + RNASE4 + APOL1 + CFHR2 + B2M + IGLC2 + C1R + 
+          MBL2 + KLF4 + CNGB3 + IMPG1 + PMS1 + PPT1 + TPSD1 + SAFB2 + 
+          REEP4 + DNPEP + PNLIPRP1 + ZHX2 + KLRK1 + C7orf50 + YAP1 + 
+          GBP1 + CEACAM20 + NEK7 + TIGIT + WDR46 + BTN1A1 + GLYR1 + 
+          DYNLT3 + NENF + IL2RG + GPD1 + DYNC1H1 + NACC1 + RALY + CEACAM19 + 
+          ATRAID + SWAP70 + BCL2 + LMNB1 + SMNDC1 + IFI30,  # Survival formula
+        data = dataset_train,
+        distribution = "coxph",    # Cox model for survival
+        n.trees = 1000,             # Number of trees
+        interaction.depth = 3,     # Tree depth
+        shrinkage = 0.01,          # Learning rate
+        n.minobsinnode = 15,       # Minimum observations in terminal nodes
+        bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+    )
+    
+  }else if (outcome == "CD4"){
+    gbm_model <- gbm(
+        formula = Surv(time, status) ~ 
+          MALESEX + baseVL_log10 + AGE + baseCD4_sqrt + 
+          VSTM2L + MSTN + ACTA2 + DDC + MARCO + SORT1 + FBP1 + ICAM3 + 
+          MFAP5 + FABP4 + FUCA1 + VASN + C2 + IGFBP6 + HSPG2 + JCHAIN + 
+          IL1RL2 + AMBN + LRRN1 + FCRL3 + AMN + CNTNAP2 + CLEC4A + 
+          PTX3 + LY75 + CLEC4G + KLRB1 + TNFRSF11A + LY9 + SCGB1A1 + 
+          MZB1 + CCL4 + FST + RRM2 + CFC1 + RARRES1 + SERPINA9 + CALB1 + 
+          GPA33 + OPTC + CCN1 + FLT1 + LAG3 + RTN4R + AMBP + CD300LF + 
+          HSPB6 + CRISP2 + KLK6 + NELL1 + C4BPB + LYPD3 + KLK1 + CTSF + 
+          KLB + NXPH1 + VSTM1 + NOS3 + PAK4 + WFIKKN1 + CRTAM + VWC2 + 
+          FUT8 + NAAA + DKK1 + SEMA4D + THY1 + SMPD1 + SPINK5 + PIK3IP1 + 
+          DSG2 + EFNA1 + FCRL5 + ARSA + MEGF11 + CPTP + GUK1 + ACTN2 + 
+          SIGLEC8 + HRC + ROBO4 + CCER2 + LAMB1 + ECHDC3 + MAN2B2 + 
+          BPIFB2 + FABP3 + GOT1 + CYTL1 + C1QL2 + AKAP12 + CST1 + C9 + 
+          AMY1A_AMY1B_AMY1C + SHBG + CFD + C1R + C1S + SELENOP + ORM1 + 
+          DTX2 + IDO1 + MCEE + DNPEP + CDH23 + VWA5A + TIGIT + CASP4 + 
+          RNF43,  # Survival formula
+        data = dataset_train,
+        distribution = "coxph",    # Cox model for survival
+        n.trees = 1000,             # Number of trees
+        interaction.depth = 3,     # Tree depth
+        shrinkage = 0.01,          # Learning rate
+        n.minobsinnode = 15,       # Minimum observations in terminal nodes
+        bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+    )
+    
+  }else{warning("Unrecognized outcome type")}
+  
+  return(gbm_model)
+}
+
+outcome <- outcomes[1]
+gbm_model <- obtain_gbmmodel(outcome, dataset_train)
+```
+
+```{r}
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+# Specify time points of interest to measure AUC
+times <- seq(2, 8) * 365
+
+# Define function to get score result
+## This function will be used in the function obtain_auc below
+obtain_scores <- function(models_list, dataset, survformula, traintest){
+  score_result <- Score(models_list,
+        formula = survformula,
+        data = dataset,
+        metrics = "auc",
+        summary = "risks",
+        times = times,
+        plots = "ROC")
+  
+  AUC_overtime <- score_result$AUC$score
+  AUC_overtime$type <- traintest
+
+  ROC_overtime <- score_result$ROC$plotframe
+  ROC_overtime$type <- traintest
+  
+  AUCROC_overtime <- list(AUC_overtime = AUC_overtime, ROC_overtime = ROC_overtime)
+
+  return(AUCROC_overtime)
+}
+
+# Define function to get the AUC over time
+obtain_aucroc <- function(outcome, metric){
+  if (metric %notin% c("AUC", "ROC")) {
+    stop("Invalid metric! Metric must be either 'AUC' or 'ROC'")
+  }
+  if (outcome %notin% c("VL4K", "HYBRID", "CD4")) {
+    stop("Invalid outcome! Metric must be one of: VL4K, HYBRID, CD4")
+  }
+  
+  # Add CD6 and others for CD4 outcome, since these were not significant for CD4 outcome
+  if ("CD6" %notin% colnames(train[[outcome]])){
+    dataset_train <- train[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      train[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+    dataset_test <- test[[outcome]] %>% filter(!is.na(status)) %>% left_join(
+      test[["VL4K"]] %>% select(ID, CD6, SH2D1A, CNGB3), by = "ID")
+  }else{
+    dataset_train <- train[[outcome]]
+    dataset_test <- test[[outcome]]
+  }
+
+  # Train the cox model
+  formula_model_small <- as.formula(paste("Surv(time, status) ~", paste(c(clinicalpredictors, proteomic_selection), collapse = " + ")))
+
+  coxmodel <- coxph(formula_model_small, dataset_train, x = TRUE)
+  
+  # Define the formula for other models
+  features <- train[[outcome]] %>% select(-c(time, status, ID)) %>% colnames()
+  formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+
+  # Train the elastic-net (balanced) penalized cox model
+  elasticnetcox_model <- GLMnet(
+    formula = formula_model,
+    data = dataset_train,
+    alpha = 1,
+    lambda = NULL,
+    cv = TRUE,
+    nfolds = 10,
+    standardize = TRUE)
+
+  # train the RSF, random survival forest
+  rsfmodel <- rfsrc(formula_model, data = dataset_train, ntree = 3000, cv.fold = 10, nodesize = 15, mtry = 4, splitrule = "logrankscore", nsplit = 10)
+
+  # Fit a GBM model with survival data
+  gbm_model <- obtain_gbmmodel(outcome = outcome, 
+                               dataset_train = dataset_train)
+
+  # Calculate AUC data over time for train and test
+  survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+  model_list <- list("Cox" = coxmodel, 
+                     "RSF" = rsfmodel,
+                     "GBM" = gbm_model,
+                     "ElasticNetCox" = elasticnetcox_model)
+  auc_train <- obtain_scores(model_list, dataset_train, survformula, "train")$AUC_overtime
+  auc_test <-  obtain_scores(model_list, dataset_test, survformula, "test")$AUC_overtime
+
+  auc_combined <- rbind(auc_train, auc_test)
+  auc_combined$outcome <- outcome
+  
+  roc_train <- obtain_scores(model_list, dataset_train, survformula, "train")$ROC_overtime
+  roc_test <-  obtain_scores(model_list, dataset_test, survformula, "test")$ROC_overtime
+
+  roc_combined <- rbind(roc_train, roc_test)
+  roc_combined$outcome <- outcome
+
+  if (metric == "AUC"){
+    return(auc_combined)
+  }else if (metric == "ROC"){
+    return(roc_combined)
+  }else{return(NA)}
+}
+
+# Apply the function to each outcome with a lambda function inside map_dfr
+auc_data <- map_dfr(outcomes, ~obtain_aucroc(outcome = .x, metric = "AUC"))
+
+roc_data <- map_dfr(outcomes, ~obtain_aucroc(outcome = .x, metric = "ROC"))
+```
+
+```{r}
+# add nice labels for model and outcome
+auc_data <- auc_data %>% mutate(
+  model = factor(
+    model, levels = c("Cox",
+                      "RSF",
+                      "ElasticNetCox",
+                      "GBM"), 
+    labels = c("Cox proportional hazards regression",
+               "Random survival forest",
+               "Elastic net cox regression",
+               "Gradient boosted machines")),
+  outcome = factor(outcome, 
+    levels = c("VL4K", "HYBRID", "CD4"),
+    labels = c("Virological loss", ">1000 copies/mL increase", "CD4 <500 cells/mm3")))
+
+# Plot AUC over time with confidence intervals
+## The plot should facetgrid on model on the x-axis and outcome on the y-axis. 
+## outcome determines color and fill. type determines shape and linetype and group.
+auc_plot <- ggplot(auc_data, aes(x = times, y = AUC, group = type)) +
+  geom_line(aes(linetype = type, color = outcome), linewidth = 1) +
+  geom_point(aes(shape = type, color = outcome), size = 2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = outcome), alpha = 0.2) +
+  labs(x = "Time (years)", 
+       y = "Area Under the Curve (AUC)", 
+       title = "Prediction model performance over time (clinical & proteomic predictors)") +
+  theme_bw() +
+  scale_colour_manual(values=(c("#5ec962","orange","darkred"))) + 
+  scale_fill_manual(values=(c("#5ec962","orange","darkred"))) + 
+  scale_y_continuous(limits = c(0.30, 1.1),
+    breaks = c(0.5, 0.75, 1.0)) +
+  scale_x_continuous(limits = c(0, 9*365),
+    breaks = seq(0, max(auc_data$times), by = 365),
+    labels = function(x) round(x / 365, 1)
+  ) +
+  facet_grid(outcome ~ model) +
+  theme(strip.placement = "outside",
+     strip.text= element_text(angle = 0, size = 8),
+     strip.background = element_blank(),
+     axis.text = element_text(size = 10, color="black"),
+     axis.title = element_text(size = 10, color="black", face = "bold"),
+     title = element_text(size=12, color = "black"),
+     legend.text = element_text(size = 10, color="black"),
+     legend.title = element_blank(),
+     legend.position = "bottom",
+     plot.subtitle = element_text(size = 10, color= "black", face="italic"),
+     #legend.key.height = unit(1.5,'cm'),
+     panel.grid.minor.x = element_blank(),
+     panel.spacing = unit(0, "mm")) +
+  
+  # keep the type legend, but remove the outcome legend
+    guides(fill = "none", color = "none", shape = guide_legend(override.aes = list(size=3))) # Remove outcome legend
+
+print(auc_plot)
+
+ggsave(paste0(outputdir,"AUC_clinical_and_proteomics.pdf"), plot = auc_plot, width = 210, height = 297/2, units = "mm")
+```
+# ROC curves 
+
+I want one plot with ROC curves, three outcomes
+5-year timepoint, elasticnet data, test and train?
+
+```{r}
+summary.factor(roc_data$model)
+
+roc_data_5yr <- roc_data %>% filter(times == 3*365) %>% 
+  filter(model == "ElasticNetCox") %>% mutate(
+    outcome = factor(outcome, 
+      levels = c("VL4K", "HYBRID", "CD4"),
+      labels = c("Virological loss", ">1000 copies/mL increase", "CD4 <500 cells/mm3")))
+
+# Plot using ggplot2
+roc_plot <- ggplot(roc_data_5yr, aes(x = FPR, y = TPR)) +
+  facet_wrap(~ outcome, dir = "h") +
+  geom_line(aes(color = outcome, linetype = type), linewidth = 0.65) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
+  scale_colour_manual(values=(c("#5ec962","orange","darkred"))) + 
+  labs(
+    title = "Receiver Operater Curve (ROC) at 3−Year Risk",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_bw()+
+    theme(strip.placement = "outside",
+     strip.text= element_text(angle = 0, size = 8),
+     strip.background = element_blank(),
+     axis.text = element_text(size = 10, color="black"),
+     axis.title = element_text(size = 10, color="black", face = "bold"),
+     title = element_text(size=12, color = "black"),
+     legend.text = element_text(size = 10, color="black"),
+     legend.title = element_blank(),
+     legend.position = "bottom",
+     plot.subtitle = element_text(size = 10, color= "black", face="italic"),
+     #legend.key.height = unit(1.5,'cm'),
+     panel.grid.minor.x = element_blank(),
+     panel.spacing = unit(5, "mm")) +
+  
+  # keep the type legend, but remove the outcome legend
+    guides(fill = "none", color = "none", shape = guide_legend(override.aes = list(size=3))) # Remove outcome legend
+
+print(roc_plot)
+
+ggsave(paste0(outputdir,"ROC_clinical_and_proteomics.pdf"), plot = roc_plot, width = 210, height = 297/3, units = "mm")
+````
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

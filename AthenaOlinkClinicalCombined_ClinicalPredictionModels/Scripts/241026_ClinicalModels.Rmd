@@ -1,0 +1,1091 @@
+---
+title: "2410246_ClinicalModels"
+author: "Albert Groenendijk"
+date: "2024-10-26"
+output: html_document
+---
+
+limma 3.58.1; survival 3.5.8; survminer 0.4.9; slider 0.3.1; RiskRegression 2023.12.21; randomForestSRC 3.3.1; glmnet 4.1.8; gbm 2.2.2
+
+
+Load libraries
+```{r}
+library(tidyverse)
+library(survival)
+library(ggplot2)
+library(riskRegression) # for time-dependent AUC calculation
+library(randomForestSRC)
+library(glmnet) # also loaded as part of riskRegression when you call GLMnet()
+library(hal9001) # also loaded as part of riskRegression when you call Hal90001()
+```
+
+Define directories
+```{r}
+inputdir <- "HIV_controllers_ATHENA/AthenaOlinkClinicalCombined_ClinicalPredictionModels/Input/"
+scriptsdir <- "HIV_controllers_ATHENA/AthenaOlinkClinicalCombined_ClinicalPredictionModels/Scripts/"
+outputdir <- "HIV_controllers_ATHENA/AthenaOlinkClinicalCombined_ClinicalPredictionModels/Output/"
+```
+
+Define generic objects
+```{r}
+`%notin%` <- Negate(`%in%`)
+```
+
+Set random seed
+```{r}
+set.seed(101)
+```
+
+Load datasets
+```{r}
+train <- readRDS(paste0(outputdir,"clinical_train.rds"))
+test <- readRDS(paste0(outputdir,"clinical_test.rds"))
+```
+
+Verify data integrity
+```{r}
+# Are the column names equal
+all(names(train) == names(test))
+
+# Ensure consistent factor levels in both train and test datasets
+factor_vars <- c("MALESEX", "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER", "baseHCVever", "baseHBVever")
+
+## Convert these variables to factors in both datasets and align levels
+for (var in factor_vars) {
+  train[[var]] <- factor(train[[var]])
+  test[[var]] <- factor(test[[var]], levels = levels(train[[var]]))  # Align levels with training data
+}
+
+check_data <- FALSE
+if (check_data){
+  # Check the data structure for both datasets
+  str(train)
+  str(test)
+  
+  # Identify missingness
+  na_counts <- sapply(train, function(x) sum(is.na(x)))
+  print(na_counts)
+  
+  na_counts <- sapply(test, function(x) sum(is.na(x)))
+  print(na_counts)
+}
+```
+
+# Run univariate Cox regression on train dataset
+
+```{r}
+# First modify AGE and BMI, for which one unit is not so relevant.
+## Instead, divide by x so that the HR for a change of x units is determined.
+train <- train %>%
+  mutate(AGE = AGE / 10,
+         baseBMI = baseBMI / 5,
+         baseCD4_sqrt = baseCD4_sqrt / 5)
+    
+## Leave baseCD4_sqrt as is since this is strongly associated with CD4_LOSS
+
+# Define features (predictors) and outcomes
+features <- c("MALESEX", "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER","baseVL_log10","baseHCV","baseHBV","baseHCVever","baseHBVever","AGE","baseBMI","baseCD4_sqrt")
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+# Frequency of outcome happening
+for (outcome in outcomes){
+  event <- paste0("EVENT_", outcome)
+  print(summary.factor(train[,event]))
+}
+
+# Define function to run and clean a univariate cox model for a specific feature and outcome
+coxph_singlerow <- function(feature, outcome, dataset){
+  # Define the formula for the cox model
+  time <- paste0("TIME_", outcome)
+  event <- paste0("EVENT_", outcome)
+  formula_coxph <- as.formula(paste("Surv(", time, ",", event, ") ~", feature))
+  
+  # filter out rows without outcome, only applicable for EVENT_CD4
+  dataset <- train %>% filter(!is.na(.data[[event]]))
+  
+  # run the univariate model
+  model <- coxph(formula_coxph, data = dataset)
+
+  # clean the cox ph model into a tibble 
+  ## With columns: estimate, std.error, statistic, p.value, conf.low, conf.high
+  sumstats <- broom::tidy(model, conf.int = TRUE, exponentiate = TRUE)
+
+  new_row <- tibble(
+    Variable = feature,
+    Number = sum(!is.na(dataset[[feature]])),
+    Outcome = event,
+    Analysis = "univariate",
+    HR = sumstats$estimate,
+    Lower = sumstats$conf.low,
+    Upper = sumstats$conf.high,
+    Pvalue = sumstats$p.value
+  )
+  
+  return(new_row)
+}
+
+# Example
+coxph_singlerow(feature = features[1], outcome = outcomes[1], dataset = dataset)
+
+# map the coxph_singlerow to every feature and outcome
+sumstats_univariate_train <- expand_grid(feature = features, outcome = outcomes) %>%
+
+  # apply to each combination of feature and outcome, storing the result in a list column
+  rowwise() %>%
+  mutate(result = list(coxph_singlerow(feature, outcome, dataset))) %>%
+  
+  # expands the list column into individual columns, effectively joining all the new rows together.
+  unnest(result) %>% 
+  
+  # also add significance levels
+  mutate(Significance = case_when(Pvalue < 0.05 & Pvalue > 0.001 ~ "*",
+                                               Pvalue < 0.001 & Pvalue > 0.0001 ~ "**",
+                                               Pvalue < 0.0001 ~ "***"))
+
+head(sumstats_univariate_train)
+```
+
+## Make forest plot of Cox regression
+
+Create nice labels for outcome measures
+```{r}
+sumstats_univariate_train$Outcome <- 
+  factor(sumstats_univariate_train$Outcome,
+         levels = rev(c("EVENT_VL4K","EVENT_HYBRID","EVENT_CD4")),
+         labels = rev(c("Viral load > 10,000 copies/mL",
+                        "Viral load >10,000 copies/mL
+                        \nor >1000 increase in moving median", 
+                        "CD4 count <500 cells/mm3\nmoving median")))
+```
+Make forest plot
+```{r}
+g <- ggplot(sumstats_univariate_train, aes(HR, Variable, color = Outcome, shape = Outcome)) +
+   geom_pointrange(aes(xmin = Lower, xmax = Upper),
+                   position = position_dodge(width = 0.5)) +
+   geom_vline(xintercept = 1, linetype = 2) +
+   theme_bw() +
+   theme(strip.placement = "outside",
+         strip.text= element_text(angle = 0, size = 6),
+         strip.background = element_blank(),
+         axis.text = element_text(size = 8, color="black"),
+         axis.title = element_text(size = 10, color="black"),
+         title = element_text(size=12, color = "black"),
+         legend.text = element_text(size = 10, color="black"),
+         legend.title = element_text(size = 10, color="black"),
+         legend.position = "bottom",
+         plot.subtitle = element_text(size = 10, color= "black", face="italic"),
+         legend.key.height = unit(1.5,'cm'),
+         panel.spacing = unit(0, "mm")) +
+   scale_colour_manual(values=rev(c("#5ec962","orange","darkred"))) + 
+     scale_x_continuous(trans='log10',limits = c(0.1,10))  +
+  xlab("Hazard ratio (95% confidence interval)") + ylab("")+
+  ggtitle("Baseline predictors for viral or immunological loss",
+          subtitle = "Univariate Cox proportional-hazards regression")
+
+g1 <- g + 
+scale_y_discrete(
+  limits = rev(c(
+    "AGE", "MALESEX", "baseBMI", "ORIGIN_NONWESTERN", 
+    "SMOKING_NEVER", "IDU", 
+    "baseHCVever", "baseHBVever", 
+    "baseCD4_sqrt", "baseVL_log10")),
+  labels = rev(c(
+    "Age", "Male sex", "BMI", "Non-Western\ncountry of birth", 
+    "Never smoked", "Intravenous\ndrug use", 
+    "History of HCV\nat baseline", "History of HBV\nat baseline", 
+    "Square root\nCD4 count", "Log10 viral load")))
+
+ggsave(paste0(outputdir, "241027_Univariate_Coxph_Train.pdf"),g1,width = 21/2, height = 29.7/2, units = "cm")
+```
+
+```{r}
+sumstats_univariate_train %>% filter(Pvalue <0.05) %>% arrange(Pvalue)
+```
+# Train the multivariate Cox model
+Remove baseBMI since there are many missing.
+
+```{r}
+# Remove those in train with missing CD4
+train <- train %>% filter(!is.na(baseCD4_sqrt))
+
+# Define features (predictors) and outcomes
+features <- c("MALESEX", "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER","baseVL_log10","baseHCVever","baseHBVever","AGE","baseBMI",
+              "baseCD4_sqrt")
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+# Frequency of outcome happening
+for (outcome in outcomes){
+  event <- paste0("EVENT_", outcome)
+  print(summary.factor(train[,event]))
+}
+
+# Define function to run and clean a univariate cox model for a specific feature and outcome
+create_multivar_coxph <- function(features, outcome, dataset){
+  # Define the formula for the cox model
+  time <- paste0("TIME_", outcome)
+  event <- paste0("EVENT_", outcome)
+  formula_coxph <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+  
+  model <- coxph(formula_coxph, dataset%>%filter(!is.na(.data[[event]])), x = TRUE)
+  
+  return(model)
+}
+
+create_multivar_coxph(features, outcomes[1], train)
+
+# note that the coxph() is so fast that I do not use the function create_multivar_coxph
+## the coxph() model is created as part of obtain_auc
+```
+
+Participant counts
+```{r}
+train %>% filter(!is.na(baseCD4_sqrt)) %>% count()
+train %>% filter(!is.na(baseCD4_sqrt)) %>% filter(!is.na(EVENT_CD4)) %>% count()
+
+test %>% filter(!is.na(baseCD4_sqrt)) %>% count()
+test %>% filter(!is.na(baseCD4_sqrt)) %>% filter(!is.na(EVENT_CD4)) %>% count()
+
+```
+
+## Improve cox model performance
+
+The problem is that the model was overfitting if I include all predictors, so external testing in test results in AUCs of 0.50.
+
+Only consider the features that were significant in univariate regression:
+- VL4K & HYBRID --> MALESEX, AGE, VLlog10 and CD4sqrt
+- CD4 --> MALESEX, VLlog10 and CD4sqrt, IDU, baseHCVever, ORIGIN_NONWESTERN, 
+- time_since_2000 causes strong overfitting probably because interaction terms and should be discarded.
+- In the RSF very consistently are the most relevant MALESEX, AGE, VLlog10 and CD4sqrt. Regardless of outcome type. Including more does not improve the model, only decreases it.
+- **Conclusion: best Cox model with only MALESEX, AGE, VLlog10 and CD4sqrt
+```{r}
+# Define features (predictors)
+features <- c("MALESEX", "AGE", 
+              #"IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER", "baseHCVever", "baseHBVever",
+              "baseVL_log10", "baseCD4_sqrt"
+              )
+
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+# Specify time points of interest to measure AUC
+
+outcome <- outcomes[2] 
+
+time <- paste0("TIME_", outcome)
+event <- paste0("EVENT_", outcome)
+formula_model <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+
+print(dim(train))
+print(dim(test))
+
+# Train the cox model
+coxmodel <- create_multivar_coxph(features, outcomes[3], train)
+
+times <- seq(2, 8) * 365
+dataset <- test
+survformula <- as.formula(paste("Surv(", time, ",", event, ") ~ 1"))
+score_result <- Score(list("Cox" = coxmodel),
+        formula = survformula,
+        data = dataset%>%filter(!is.na(.data[[event]])),
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+
+```
+
+## Penalized cox models
+
+alpha = 1 for lasso, alpha = 0 for ridge
+
+Ridge (L2): Useful when you suspect all variables may be relevant but need regularization.
+Lasso (L1): Helps with feature selection by pushing less informative coefficients to zero, simplifying the model.
+```{r}
+# Define features (predictors)
+features <- c("MALESEX", "AGE", 
+              "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER", "baseHCVever", "baseHBVever",
+              "baseVL_log10", "baseCD4_sqrt"
+              )
+
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+# Specify time points of interest to measure AUC
+
+outcome <- outcomes[1] 
+
+time <- paste0("TIME_", outcome)
+event <- paste0("EVENT_", outcome)
+formula_model <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+
+print(dim(train))
+print(dim(test))
+
+# GLMnet from riskregression is compatible with Score(), but glmnet (lowercase) library is NOT.
+# the ?glmnet is very useful for documentation on model parameters.
+# alpha = 1 means elasticnet mixing parameter is lasso penalty, and alpha=0 sets it to ridge penalty
+train <- train %>% filter(!is.na(baseCD4_sqrt))
+
+penalizedmodel_lasso <- GLMnet(formula_model, data = train, alpha = 1, lambda = NULL, cv = TRUE, nfolds = 10, standardize = TRUE)
+
+na_counts <- sapply(test, function(x) sum(is.na(x)))
+print(na_counts)
+
+times <- seq(2, 8) * 365
+dataset <- test
+survformula <- as.formula(paste("Surv(", time, ",", event, ") ~ 1"))
+score_result <- Score(list("Penalized" = penalizedmodel_lasso),
+        formula = survformula,
+        data = dataset%>%filter(!is.na(.data[[event]])),
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+## Find optimal alpha for elasticnet
+```{r}
+# Define a sequence of alpha values to test
+alpha_values <- seq(0, 1, by = 0.1)  # Adjust step size as needed
+
+# Initialize a data frame to store results
+elasticnet_cvresults <- data.frame(alpha = numeric(), lambda_min = numeric(), cvm_min = numeric(), outcome = character())
+
+features <- c("MALESEX", "AGE", 
+              "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER", "baseHCVever", "baseHBVever",
+              "baseVL_log10", "baseCD4_sqrt"
+              )
+
+for (outcome in outcomes){
+  
+  time <- paste0("TIME_", outcome)
+  event <- paste0("EVENT_", outcome)
+  formula_model <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+  
+  # Loop through each alpha value
+  for (alpha in alpha_values) {
+    # Perform cross-validation for each alpha
+    set.seed(123)  # For reproducibility
+    
+    penalizedmodel_balanced <- GLMnet(formula_model, data = train, alpha = alpha, lambda = NULL, cv = TRUE, nfolds = 10, standardize = TRUE)
+  
+    # Store the results: best lambda and corresponding CV error
+    elasticnet_cvresults <- rbind(
+      elasticnet_cvresults, 
+      data.frame(alpha = alpha,
+                 lambda_min = penalizedmodel_balanced$fit$lambda.min,
+                 cvm_min = min(penalizedmodel_balanced$fit$cvm),
+                 outcome = outcome))
+  }
+}
+elasticnet_cvresults
+
+# Find the optimal alpha based on minimum CV error
+optimal_alpha_value <- elasticnet_cvresults %>% group_by(outcome) %>% filter(cvm_min == min(cvm_min)) %>% select(alpha, outcome) %>%  pull(alpha, outcome) 
+
+print(paste0('optimal alpha for glmnet: ',optimal_alpha_value))
+```
+
+# Gradient boosted machine
+
+Test the code with simple random data
+```{r}
+# Load libraries
+library(gbm)
+library(riskRegression)
+library(survival)  # For Surv function
+
+# Generate sample survival data
+set.seed(123)
+data <- data.frame(
+    time = rexp(100, rate = 0.1),          # Random survival times
+    status = rbinom(100, 1, 0.5),          # Random event indicator (1 = event, 0 = censoring)
+    x1 = rnorm(100),                       # Predictor 1
+    x2 = rnorm(100)                        # Predictor 2
+)
+
+# Fit a GBM model with survival data
+gbm_model <- gbm(
+    formula = Surv(time, status) ~ x1 + x2,  # Survival formula
+    data = data,
+    distribution = "coxph",                    # Cox model for survival
+    n.trees = 100,                           # Number of trees
+    interaction.depth = 3,                   # Tree depth
+    shrinkage = 0.01,                        # Learning rate
+    n.minobsinnode = 10                      # Minimum observations in terminal nodes
+)
+
+# Prepare new data for prediction
+new_data <- data.frame(x1 = rnorm(10), x2 = rnorm(10))
+
+# Use Score function with the GBM survival model
+score_result <- Score(
+    list("GBM Model" = gbm_model), 
+    formula = Surv(time, status) ~ 1,   # Survival formula for Score function
+    data = data,                        # Original data with survival info
+    times = c(1, 5, 10),                # Time points to evaluate the survival model
+    metrics = "AUC",                  # Metric for model evaluation
+    summary = "risks"                     # Summary option for integrated Brier score
+)
+
+# Print results
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+
+Train the gbm model
+```{r}
+# Define features (predictors)
+features <- c("MALESEX", "AGE",
+              "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER", "baseHCVever", "baseHBVever",
+              "baseVL_log10", "baseCD4_sqrt"
+              )
+
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+# Specify time points of interest to measure AUC
+
+outcome <- outcomes[1]
+
+time <- paste0("TIME_", outcome)
+event <- paste0("EVENT_", outcome)
+formula_model <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+
+print(dim(train))
+print(dim(test))
+train <- train %>% filter(!is.na(baseCD4_sqrt))
+
+# Fit a GBM model with survival data
+data <- train
+data$time <- data$TIME_VL4K
+data$status <- data$EVENT_VL4K
+gbm_model <- gbm(
+    formula = Surv(time, status) ~ MALESEX + AGE + IDU + ORIGIN_NONWESTERN + 
+    SMOKING_NEVER + baseHCVever + baseHBVever + 
+    baseVL_log10 + baseCD4_sqrt,  # Survival formula
+    data = data,
+    distribution = "coxph",                    # Cox model for survival
+    n.trees = 1000,                           # Number of trees
+    interaction.depth = 3,                   # Tree depth
+    shrinkage = 0.01,                        # Learning rate
+    n.minobsinnode = 15,                      # Minimum observations in terminal nodes
+    bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+)
+
+# Test data
+test_data <- test
+test_data$time <- test_data$TIME_VL4K
+test_data$status <- test_data$EVENT_VL4K
+
+# Use Score function with the GBM survival model
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(", time, ",", event, ") ~ 1"))
+score_result <- Score(
+    list("GBM Model" = gbm_model), 
+    formula = survformula,   # Survival formula for Score function
+    data = data,                        # Original data with survival info
+    times = times,                # Time points to evaluate the survival model
+    metrics = "AUC",                  # Metric for model evaluation
+    summary = "risks"                     # Summary option for integrated Brier score
+)
+
+# Print results
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+
+Try to improve the performance of CD4 prediction
+```{r}
+outcome <- outcomes[3]
+data <- train %>% filter(!is.na(EVENT_CD4))
+data$time <- data$TIME_CD4
+data$status <- data$EVENT_CD4
+test_data <- test %>% filter(!is.na(EVENT_CD4))
+test_data$time <- test_data$TIME_CD4
+test_data$status <- test_data$EVENT_CD4
+
+gbm_model <- gbm(
+    formula = Surv(time, status) ~ MALESEX + AGE + IDU + ORIGIN_NONWESTERN + 
+    SMOKING_NEVER + baseHCVever + baseHBVever + 
+    baseVL_log10 + baseCD4_sqrt,  # Survival formula
+    data = data,
+    distribution = "coxph",                    # Cox model for survival
+    n.trees = 1500,                           # Number of trees
+    interaction.depth = 4,                   # Tree depth
+    shrinkage = 0.05,                        # Learning rate
+    n.minobsinnode = 20,                      # Minimum observations in terminal nodes
+    bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+)
+
+# Use Score function with the GBM survival model
+times <- seq(2, 8) * 365
+survformula <- as.formula(paste("Surv(", time, ",", event, ") ~ 1"))
+score_result <- Score(
+    list("GBM Model" = gbm_model), 
+    formula = survformula,   # Survival formula for Score function
+    data = data,                        # Original data with survival info
+    times = times,                # Time points to evaluate the survival model
+    metrics = "AUC",                  # Metric for model evaluation
+    summary = "risks"                     # Summary option for integrated Brier score
+)
+
+# Print results
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "train"
+
+score_result <- Score(
+    list("GBM Model" = gbm_model), 
+    formula = survformula,   # Survival formula for Score function
+    data = test_data,                        # Original data with survival info
+    times = times,                # Time points to evaluate the survival model
+    metrics = "AUC",                  # Metric for model evaluation
+    summary = "risks"                     # Summary option for integrated Brier score
+)
+AUC_overtime2 <- score_result$AUC$score
+AUC_overtime2$type <- "test"
+
+AUC_overtime <- rbind(AUC_overtime, AUC_overtime2)
+print(AUC_overtime)
+```
+
+```{r}
+#-----------------------------------------
+# Define grid of hyperparameters to search over
+n.trees.values <- c(500, 1000, 1500)
+interaction.depth.values <- c(2, 3, 4)
+shrinkage.values <- c(0.01, 0.05, 0.1)
+n.minobsinnode.values <- c(10, 15, 20)
+
+# Initialize variables to store the best model and best AUC score
+best_auc <- -Inf
+best_params <- list()
+
+# Loop over all combinations of hyperparameters
+for (n.trees in n.trees.values) {
+  for (interaction.depth in interaction.depth.values) {
+    for (shrinkage in shrinkage.values) {
+      for (n.minobsinnode in n.minobsinnode.values) {
+
+        # Train GBM model with the current set of hyperparameters
+        gbm_model <- gbm(
+          formula = Surv(time, status) ~ MALESEX + AGE + IDU + ORIGIN_NONWESTERN + 
+            SMOKING_NEVER + baseHCVever + baseHBVever + 
+            baseVL_log10 + baseCD4_sqrt,
+          data = data,
+          distribution = "coxph",
+          n.trees = n.trees,
+          interaction.depth = interaction.depth,
+          shrinkage = shrinkage,
+          n.minobsinnode = n.minobsinnode,
+          bag.fraction = 0.5
+        )
+
+        # Define survival formula for Score function
+        survformula <- as.formula("Surv(time, status) ~ 1")
+        
+        # Score model using AUC metric
+        score_result <- Score(
+          list("GBM Model" = gbm_model), 
+          formula = survformula,
+          data = test_data,
+          times = seq(2, 8) * 365,
+          metrics = "AUC",
+          summary = "risks"
+        )
+
+        # Extract the maximum AUC from the score results
+        maxauc <- max(score_result$AUC$score$AUC)
+
+        # Update best model parameters if current AUC is the highest found
+        if (maxauc > best_auc) {
+          best_auc <- maxauc
+          best_params <- list(
+            n.trees = n.trees,
+            interaction.depth = interaction.depth,
+            shrinkage = shrinkage,
+            n.minobsinnode = n.minobsinnode
+          )
+        }
+
+        # Print current iteration results (optional)
+        # cat("n.trees:", n.trees, 
+        #     "interaction.depth:", interaction.depth, 
+        #     "shrinkage:", shrinkage, 
+        #     "n.minobsinnode:", n.minobsinnode, 
+        #     "Max AUC:", maxauc, "\n")
+      }
+    }
+  }
+}
+
+# Output the best AUC and parameters
+cat("Best AUC:", best_auc, "\n")
+cat("Best Parameters:\n",names(best_params), "\n", unlist(best_params)) 
+```
+
+
+
+# HAL model, highly adaptable lasso
+
+**This is a computationally intensive model, not suited for the proteomics data.**
+
+On the HAL model:
+https://cran.r-project.org/web/packages/hal9001/hal9001.pdf
+
+max_degree is highest order of interaction terms for basic functions
+num_knots is maximum number of knots/bins for basic functions, should decrease with higher max_degree orders.
+smoothness_order controls the degree of smoothness, higher is more complex but risk of overfitting. Often set to 1 or 2. 1 means main effects + twoway interactions and 2 is more complex.
+
+The package advises as good settings:
+
+- If smoothness_orders = 1+ and max_degree = 3, num_knots = c(100, 75, 50).
+
+```{r}
+# Define features (predictors)
+# features <- c("MALESEX", "AGE", 
+#               "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER", "baseHCVever", "baseHBVever",
+#               "baseVL_log10", "baseCD4_sqrt"
+#               )
+# 
+# # Define outcome measures
+# outcomes <- c("VL4K","HYBRID", "CD4")
+# # Specify time points of interest to measure AUC
+# 
+# outcome <- outcomes[1] 
+# 
+# time <- paste0("TIME_", outcome)
+# event <- paste0("EVENT_", outcome)
+# formula_model <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+# 
+# print(dim(train))
+# print(dim(test))
+# train <- train %>% filter(!is.na(baseCD4_sqrt))
+# 
+# # Measure how long this takes:
+# system_time <- system.time({
+#   halmodel <- Hal9001(formula_model, data = train, lambda = NULL, smoothness_orders = 1, max_degree = 3, num_knots = c(100, 75, 50))
+# })
+# 
+# print(system_time)
+
+#halmodel <- Hal9001(formula_model, data = train, lambda = NULL, smoothness_orders = 1, max_degree = 3, num_knots = c(100, 75, 50))
+# 
+# times <- seq(2, 8) * 365
+# dataset <- test
+# survformula <- as.formula(paste("Surv(", time, ",", event, ") ~ 1"))
+# score_result <- Score(list("Penalized" = penalizedmodel_lasso),
+#         formula = survformula,
+#         data = dataset%>%filter(!is.na(.data[[event]])),
+#         metrics = "auc",
+#         summary = "risks",
+#         times = times)
+# AUC_overtime <- score_result$AUC$score
+# AUC_overtime$type <- "test"
+# print(AUC_overtime)
+
+```
+
+
+# Train the random survival forest model (RSF)
+Initially without prefiltering, since there are not so many variables.
+Remove baseBMI since there are many missing.
+
+Non-parametric machine learning approach.
+
+The rfsrc() function offers many parameters for fine-tuning:
+* mtry: Number of variables randomly selected at each split
+* nodesize: Minimum size of terminal nodes
+* splitrule: Rule used for splitting nodes
+
+
+```{r}
+# Remove those in train with missing CD4 at baseline (there are no missing in the test)
+train <- train %>% filter(!is.na(baseCD4_sqrt))
+
+# Define features (predictors)
+features <- c("MALESEX", "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER","baseVL_log10","baseHCVever","baseHBVever","AGE",
+              "baseCD4_sqrt")
+
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+```
+
+
+Tweak the model
+
+- In survival, nodesize is minimum 15, mtry is usually 1/3 (regression) or sqrt (classification), which is 4 rounded up for our ten features
+
+```{r}
+train_rsf <- function(outcome, dataset, features,
+                      nodesize = 65, mtry = 4, ntree = 1000, cvfold = 10, 
+                      splitrule = "logrankscore", nsplit = 10, 
+                      printresults = TRUE, tunedmodel = FALSE){
+  time <- paste0("TIME_", outcome)
+  event <- paste0("EVENT_", outcome)
+  formula_rsf <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+  
+  # only needed for CD4 outcome:
+  dataset <- dataset %>% filter(!is.na(.data[[event]]))
+  
+  if (tunedmodel){
+    tuned_model <- tune(formula_rsf, data = train)
+    print(tuned_model$optimal)
+  }
+  
+  # train the rsf model
+  rsfmodel <- rfsrc(formula_rsf, data = train, ntree = ntree, cv.fold = cvfold, nodesize = nodesize, mtry = mtry, splitrule = splitrule, nsplit = nsplit)
+
+  # relative importance
+  cv_vimp_results <- vimp(rsfmodel)
+  
+  if (printresults) {
+    print(rsfmodel)
+    plot(cv_vimp_results)
+  }
+  
+  return(rsfmodel)
+}
+
+run_example_rsf <- FALSE
+if (run_example_rsf) {
+  temp <- train_rsf("VL4K", train,  features, nodesize = 15, mtry = 4, splitrule = "logrankscore")
+  temp <- train_rsf("HYBRID", train, features, nodesize = 15, mtry = 4, splitrule = "logrank")
+  temp <- train_rsf("CD4", train, features, nodesize = 15, mtry = 4, splitrule = "logrankscore")
+}
+
+```
+
+Try to improve the performance of CD4 prediction
+```{r}
+features <- c("MALESEX", "AGE",
+              "IDU", "ORIGIN_NONWESTERN", "SMOKING_NEVER","baseHCVever","baseHBVever",
+              "baseCD4_sqrt","baseVL_log10")
+outcome <- outcomes[2] 
+
+time <- paste0("TIME_", outcome)
+event <- paste0("EVENT_", outcome)
+formula_model <- as.formula(paste("Surv(", time, ",", event, ") ~", paste(features, collapse = " + ")))
+
+print(dim(train))
+print(dim(test))
+
+# Train the rsf model
+temp <- train_rsf(outcomes[2], train, features, nodesize = 15, mtry = 4, splitrule = "logrankscore",printresults = FALSE)
+
+times <- seq(2, 8) * 365
+dataset <- test
+survformula <- as.formula(paste("Surv(", time, ",", event, ") ~ 1"))
+score_result <- Score(list("RSF" = temp),
+        formula = survformula,
+        data = dataset%>%filter(!is.na(.data[[event]])),
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+AUC_overtime <- score_result$AUC$score
+AUC_overtime$type <- "test"
+print(AUC_overtime)
+```
+
+## Display the relevance of each predictor in the RSF model
+
+```{r}
+# filter missing data (n=8)
+train <- train %>% filter(!is.na(baseCD4_sqrt))
+
+# Define features (predictors)
+features <- c("MALESEX", "AGE",
+              "SMOKING_NEVER","baseHCVever","baseHBVever",
+              "IDU", "ORIGIN_NONWESTERN",
+              "baseCD4_sqrt", "baseVL_log10")
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+meandecreaseaccuracy = list()
+
+obtain_meandecreaseaccuracy <- function(outcome){
+# Rename the data in train
+  train <- train %>%
+    mutate(time = .data[[paste0("TIME_", outcome)]],
+           status = .data[[paste0("EVENT_", outcome)]]) %>%
+    ## Only relevant for CD4LOSS: some do not have the outcome
+    filter(!is.na(status))
+
+  test <- test %>%
+    mutate(time = .data[[paste0("TIME_", outcome)]],
+           status = .data[[paste0("EVENT_", outcome)]]) %>%
+    ## Only relevant for CD4LOSS: some do not have the outcome
+    filter(!is.na(status))
+
+
+  # train the RSF, random survival forest
+  formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+  rsfmodel <- rfsrc(formula_model, data = train, ntree = 1000, cv.fold = 10, nodesize = 65, mtry = 4, splitrule = "logrankscore", nsplit = 10)
+
+importance_df <- tibble(
+  Outcome = outcome,
+  Variable = names(vimp(rsfmodel)$importance),
+  MeanDecreaseAccuracy = vimp(rsfmodel)$importance
+  ) 
+
+meandecreaseaccuracy[[outcome]] <- importance_df
+return(meandecreaseaccuracy)
+}
+
+# Make a list of all results
+for (outcome in outcomes){
+  meandecreaseaccuracy <- obtain_meandecreaseaccuracy(outcome)
+}
+
+# Perform cleaning operations on the list
+for (outcome in outcomes){
+  meandecreaseaccuracy[[outcome]] <- meandecreaseaccuracy[[outcome]] %>%
+    mutate(
+      Outcome = factor(
+        Outcome, 
+        levels = c("VL4K", "HYBRID", "CD4"),
+        labels = c("Virological loss", 
+                   ">1000 copies/mL increase", 
+                   "CD4 <500 cells/mm3")),
+      Variable = factor(
+        Variable,
+        levels = c("AGE", "MALESEX", "baseBMI", "ORIGIN_NONWESTERN",
+                   "SMOKING_NEVER", "IDU",
+                   "baseHCVever", "baseHBVever",
+                   "baseCD4_sqrt", "baseVL_log10"),
+        labels = c("Age", "Male sex", "BMI", "Non-Western country of birth",
+                  "Never smoked", "Intravenous drug use",
+                  "History of HCV at baseline", "History of HBV at baseline",
+                  "Square root CD4 count", "Log10 viral load"))
+      )
+}
+
+# Create the ggplot
+var_importance_plot <- function(outcome_index){
+  i <- outcome_index
+  data <- meandecreaseaccuracy[[outcomes[i]]]
+  fillcolor <- c("#5ec962","orange","darkred")[i]
+  g <- ggplot(data, aes(x = reorder(Variable, MeanDecreaseAccuracy, .desc = TRUE), y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = fillcolor, width = 0.5) +
+  coord_flip() +
+  labs(title = "Variable Importance in Random Survival Forest",
+       x = "Variables",
+       y = "Mean Decrease in Accuracy") +
+  theme_bw() +
+  theme(strip.placement = "outside",
+     strip.text = element_text(angle = 0, size = 8),
+     strip.background = element_blank(),
+     axis.text = element_text(size = 8, color = "black"),
+     axis.title.y = element_blank(),
+     axis.title.x = element_text(size = 10),
+     plot.title = element_text(size = 12, face = "bold")) + 
+    
+    annotate("text", x = 5, y = max(data$MeanDecreaseAccuracy), 
+             angle = 90, size = 8 / .pt, vjust = -1,
+             label = meandecreaseaccuracy[[outcomes[i]]]$Outcome[1]) 
+  
+  print(g)
+}
+
+for (i in c(1:length(outcomes))){
+  ggsave(paste0(outputdir, "VariableImportanceRSF_", outcomes[i], ".pdf"),var_importance_plot(i),width = 21/2, height = 29.7/6, units = "cm")
+
+}
+```
+
+
+
+# Test performance of the models with the test datasets
+
+Here I make a function to obtain the risk scores of the model, called obtain_scores(), which is used in another function, called obtain_auc(). The function obtain_auc() also runs the coxph() model for each outcome.
+```{r}
+# Remove those in train with missing CD4 at baseline (there are no missing in the test)
+train <- train %>% filter(!is.na(baseCD4_sqrt))
+
+# Define features (predictors)
+features <- c("MALESEX", "AGE",
+              "SMOKING_NEVER","baseHCVever","baseHBVever",
+              "IDU", "ORIGIN_NONWESTERN",
+              "baseCD4_sqrt", "baseVL_log10")
+# Define outcome measures
+outcomes <- c("VL4K","HYBRID", "CD4")
+
+# Specify time points of interest to measure AUC
+times <- seq(2, 8) * 365
+
+# Define function to get score result
+## This function will be used in the function obtain_auc below
+obtain_scores <- function(models_list, dataset, survformula, traintest){
+  score_result <- Score(models_list,
+        formula = survformula,
+        data = dataset,
+        metrics = "auc",
+        summary = "risks",
+        times = times)
+  AUC_overtime <- score_result$AUC$score
+  AUC_overtime$type <- traintest
+  
+  return(AUC_overtime)
+}
+
+# Define function to get the AUC over time
+obtain_auc <- function(outcome){
+  
+  # Rename the data in train
+  train <- train %>%
+    mutate(time = .data[[paste0("TIME_", outcome)]],
+           status = .data[[paste0("EVENT_", outcome)]]) %>%
+    ## Only relevant for CD4LOSS: some do not have the outcome
+    filter(!is.na(status))
+
+  test <- test %>%
+    mutate(time = .data[[paste0("TIME_", outcome)]],
+           status = .data[[paste0("EVENT_", outcome)]]) %>%
+    ## Only relevant for CD4LOSS: some do not have the outcome
+    filter(!is.na(status))
+
+  # Check that the data is the same
+  print("status" %in% colnames(train))
+  print("status" %in% colnames(train))
+  print(sum(train$time != train[,paste0("TIME_", outcome)]))
+  print(sum(train$status != train[,paste0("EVENT_", outcome)]))
+  print(sum(test$time != test[,paste0("TIME_", outcome)]))
+  print(sum(test$status != test[,paste0("EVENT_", outcome)]))
+
+  # Train the cox model
+  features_cox <- c("MALESEX", "AGE","baseCD4_sqrt", "baseVL_log10")
+  formula_cox <- as.formula(paste("Surv(time, status) ~", paste(features_cox, collapse = " + ")))
+  coxmodel <- coxph(formula_cox, train, x = TRUE)
+  
+  # Define the formula for other models
+  formula_model <- as.formula(paste("Surv(time, status) ~", paste(features, collapse = " + ")))
+  
+  # Train the elastic-net (balanced) penalized cox model
+  elasticnetcox_model <- GLMnet(
+    formula = formula_model,
+    data = train,
+    alpha = optimal_alpha_value[outcome],
+    lambda = NULL,
+    cv = TRUE,
+    nfolds = 10,
+    standardize = TRUE)
+
+  # train the RSF, random survival forest
+  rsfmodel <- rfsrc(formula_model, data = train, ntree = 1000, cv.fold = 10, nodesize = 65, mtry = 4, splitrule = "logrankscore", nsplit = 10)
+  
+  # Fit a GBM model with survival data
+  gbm_model <- gbm(
+      formula = Surv(time, status) ~ MALESEX + AGE + IDU + ORIGIN_NONWESTERN +
+      SMOKING_NEVER + baseHCVever + baseHBVever +
+      baseVL_log10 + baseCD4_sqrt,  # Survival formula
+      data = train,
+      distribution = "coxph",                    # Cox model for survival
+      n.trees = 500,                           # Number of trees
+      interaction.depth = 4,                   # Tree depth
+      shrinkage = 0.05,                        # Learning rate
+      n.minobsinnode = 15,                      # Minimum observations in terminal nodes
+      bag.fraction = 0.5 # fraction of training data used for fitting, default 0.5
+  )
+
+  # Calculate AUC data over time for train and test
+  survformula <- as.formula(paste("Surv(time, status) ~ 1"))
+  model_list <- list("Cox" = coxmodel, 
+                     "RSF" = rsfmodel,
+                     "ElasticNetCox" = elasticnetcox_model,
+                     "GBM" = gbm_model)
+  auc_train <- obtain_scores(model_list, train, survformula, "train")
+  auc_test <-  obtain_scores(model_list, test, survformula, "test")
+
+  auc_combined <- rbind(auc_train, auc_test)
+  auc_combined$outcome <- outcome
+
+  return(auc_combined)
+}
+
+# Apply the function to each outcome
+auc_data <- map_dfr(outcomes, obtain_auc)
+
+# add nice labels for model and outcome
+auc_data <- auc_data %>% mutate(
+  model = factor(
+    model, levels = c("Cox",
+                      "RSF",
+                      "ElasticNetCox",
+                      "GBM"), 
+    labels = c("Cox proportional hazards regression",
+               "Random survival forest",
+               "Elastic net cox regression",
+               "Gradient boosted machines")),
+  outcome = factor(outcome, 
+    levels = c("VL4K", "HYBRID", "CD4"),
+    labels = c("Virological loss", ">1000 copies/mL increase", "CD4 <500 cells/mm3")))
+
+# Plot AUC over time with confidence intervals
+## The plot should facetgrid on model on the x-axis and outcome on the y-axis. 
+## outcome determines color and fill. type determines shape and linetype and group.
+auc_plot <- ggplot(auc_data, aes(x = times, y = AUC, group = type)) +
+  geom_line(aes(linetype = type, color = outcome), linewidth = 1) +
+  geom_point(aes(shape = type, color = outcome), size = 2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = outcome), alpha = 0.2) +
+  labs(x = "Time (years)", 
+       y = "Area Under the Curve (AUC)", 
+       title = "Prediction model performance over time (clinical predictors only)") +
+  theme_bw() +
+  scale_colour_manual(values=(c("#5ec962","orange","darkred"))) + 
+  scale_fill_manual(values=(c("#5ec962","orange","darkred"))) + 
+  scale_y_continuous(limits = c(0.35, 1.1),
+    breaks = c(0.5, 0.75, 1.0)) +
+  scale_x_continuous(limits = c(0, 9*365),
+    breaks = seq(0, max(auc_data$times), by = 365),
+    labels = function(x) round(x / 365, 1)
+  ) +
+  facet_grid(outcome ~ model) +
+  theme(strip.placement = "outside",
+     strip.text= element_text(angle = 0, size = 8),
+     strip.background = element_blank(),
+     axis.text = element_text(size = 10, color="black"),
+     axis.title = element_text(size = 10, color="black", face = "bold"),
+     title = element_text(size=12, color = "black"),
+     legend.text = element_text(size = 10, color="black"),
+     legend.title = element_blank(),
+     legend.position = "bottom",
+     plot.subtitle = element_text(size = 10, color= "black", face="italic"),
+     #legend.key.height = unit(1.5,'cm'),
+     panel.grid.minor.x = element_blank(),
+     panel.spacing = unit(0, "mm")) +
+  
+  # keep the type legend, but remove the outcome legend
+    guides(fill = "none", color = "none", shape = guide_legend(override.aes = list(size=3))) # Remove outcome legend
+
+print(auc_plot)
+
+ggsave(paste0(outputdir,"AUC_clinicalpredictorsonly.pdf"), plot = auc_plot, width = 210, height = 297/2, units = "mm")
+```
+## Create ROC curves for the models with the test datasets 
+
+```{r}
+# roc_plot <- ggplot(roc_data, aes(x = FP, y = TP, color = model, linetype = model)) +
+#   geom_line(size = 1) +
+#   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+#   facet_wrap(~ times) +
+#   scale_color_brewer(palette = "Set1") +
+#   labs(x = "False Positive Rate", 
+#        y = "True Positive Rate",
+#        title = "ROC Curves for Random Survival Forest and Cox Model",
+#        subtitle = paste("AUC at 60 months - RSF:", 
+#                         round(roc_data$AUC[roc_data$times == 60 & roc_data$model == "RSF"], 3),
+#                         "Cox:", 
+#                         round(roc_data$AUC[roc_data$times == 60 & roc_data$model == "Cox"], 3))) +
+#   theme_bw() +
+#   coord_equal() +
+#   theme(legend.position = "bottom")
+# 
+# print(roc_plot)
+
+```
+

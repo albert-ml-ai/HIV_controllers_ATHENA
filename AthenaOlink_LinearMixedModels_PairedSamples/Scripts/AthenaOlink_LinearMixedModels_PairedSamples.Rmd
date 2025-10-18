@@ -1,0 +1,1181 @@
+---
+title: "240212_ATHENAOLINK_ART_TIME"
+output: html_document
+author: "Albert Groenendijk"
+date: "2024-02-12"
+---
+
+Created in October 2023 by Albert.
+Updated by Albert, starting 12 February 2024.
+
+Snippets of code inserted from or inspired by Nadira's scripts.
+
+## Explore effect of ART and TIME.
+We make the following PC plots to explore: before and after ART (all, by duration, INSTI, NNRTI, PI). And a PCA over time without ART.
+
+This section is approached as follows: 
+
+* First, we evaluate the VC who start ART without virological loss (VL <10,000), called persistent VC, before and after ART
+* Second, we evaluate the persistent VC over time.
+* Third, we correlate the two findings
+* We then also report the transient VC and EC before and after ART
+
+Note that in Limma, it is best to analyse all samples together and then define groups (contrasts) when applying ebayes() formula to determine t statistics and p values. However, in the manuscript we publish the results of Linear mixed models to account for non-linear effects within pairs. The statistical power is less than Bayesian, unfortunately.
+
+### Summary of group sizes
+
+* n=57 persistent VC who start ART
+* n=36 Transient VC who start ART
+* n=9 EC who start ART
+* Additionally 19 EC and 23 VC are included who have paired samples
+
+```{r echo=T, results='hide', warning=F,message=F}
+working_dir <- c("HIV_controllers_ATHENA/AthenaOlink_LinearMixedModels_PairedSamples/")
+
+library(FactoMineR)
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(table1)
+library(ggbiplot)
+library(ggplot2)
+library(openxlsx)
+library(limma)
+library(tidyverse)
+library(ggrepel)
+```
+
+#### Prepare functions
+```{r regression between pcs and metavariables and visualization}
+library(magrittr)
+plot_PCA_regression <- function(pca,
+                                meta_data,
+                                meta_variables,
+                                title = 'PC contribution',
+                                plotname) {
+  # Extract results
+  pca_res <- pca$ind$coord
+  # Select metadata to regress on
+  meta_data_filtered <- meta_data %>% select(all_of(meta_variables))
+  
+  # Extract percentage of variance explained for xlabs
+  pcnames <- paste0("PC", c(1:5), " (", round(pca$eig[c(1:5),"percentage of variance"],1), "%)")
+  
+  # Run linear regression model
+  for(i in colnames(meta_data_filtered)){
+    # Exclude metadata features with less than two unique variables
+    if(length(unique(meta_data_filtered[ ,i])) <2 ){
+      print(paste("exclude", i, sep = " "))
+    }
+  }
+  # Initiate output dataframe
+  pca_adj_r_sq <- matrix(data = NA, ncol = ncol(pca_res), nrow = ncol(meta_data_filtered)) %>%
+    set_colnames(colnames(pca_res)) %>%
+    set_rownames(colnames(meta_data_filtered))
+  # Loop over combinations of metadata and PCs and fill dataframe
+  for(i in 1:ncol(pca_res)){
+    for(j in 1:ncol(meta_data_filtered)){
+      pca_adj_r_sq[j,i] <- summary(lm(pca_res[,i] ~ meta_data_filtered[,j], na.action = na.exclude))$adj.r.squared
+    }
+  }
+  
+  colnames(pca_adj_r_sq) <- pcnames
+  
+  # Define color scheme
+  paletteLength<-50
+  my_palette <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+  # Calculate most extreme rsq (either positive or negative)
+  rsq_max <- max(abs(min(pca_adj_r_sq)), max(pca_adj_r_sq))
+  breakList <- seq(-0.5, 0.5, by = (1/paletteLength))
+  #breakList <- seq(-rsq_max, rsq_max, by = (2*rsq_max/paletteLength))
+  # breakList <- c(seq(-rsq_max, 0, length.out = ceiling(paletteLength/2) + 1), 
+  #                seq(max(pca_adj_r_sq)/paletteLength, max(pca_adj_r_sq), length.out = floor(paletteLength/2)))
+  # Plot heatmap
+  
+  hm <- pheatmap::pheatmap(as.matrix(pca_adj_r_sq),
+                           cluster_rows = F,
+                           cluster_cols = F,
+                           show_rownames = T,
+                           show_colnames = T,
+                           scale = "none",
+                           main = title,
+                           display_numbers = T,
+                           color= my_palette,
+                           breaks = breakList)
+  
+  # to save pheatmap, use function. 
+  ### Source: https://stackoverflow.com/questions/43051525/how-to-draw-pheatmap-plot-to-screen-and-also-save-to-file
+  save_pheatmap_pdf <- function(x, filename, width=4, height=5) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(paste0(working_dir,"Outputs/",filename), width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+  }
+  
+save_pheatmap_pdf(hm, plotname)
+}
+
+```
+
+#### PC regression with uncorrected data
+```{r}
+library(FactoMineR)
+library(missMDA) # to impute PCA with the mean, in case of missing values, as advised by FactoMineR documentation
+
+merge_df <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Time_ART_Paired_Cleaned.rds"))
+
+# select metadata with covariates
+metadata <- merge_df[,c("AGE", "SEX", "BMI", "BMI_CAT", "ETHNICITY",
+                         "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                         "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                         "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                         "SMOKING_EVER_T1", "SMOKING_CURRENT", 
+                         "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                         "STORAGE_TIME")]
+
+# select olink columns # GROUP3 was set as last clinical column
+npx <- merge_df[,c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))]
+
+# plot the PCs against selected covariates before correction
+res.comp <- imputePCA(npx,ncp=5)
+PCA_before_correction <- PCA(res.comp, scale.unit = T, graph = F)
+
+plot_PCA_regression(PCA_before_correction,
+                    meta_data = metadata,
+                    meta_variables = c("AGE", "SEX", "BMI", "BMI_CAT", "ETHNICITY",
+                                       "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                                       "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                                       "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                                       "SMOKING_EVER_T1", "SMOKING_CURRENT", 
+                                       "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                                       "STORAGE_TIME"),
+                    plotname = "Supplements_ECVCART_PCA_regression_uncorrected.pdf"
+                    )
+```
+#### Define function to run PC regression on residuals
+```{r}
+library(limma)
+# create function to provide PCAregression after inserting the design matrix, and plot title.
+f <- function(design_cov,ti) {
+# if there are NA in any of the covariates, the error will be: row dimension of design doesn't match column dimension of data object
+# in this case, people with NA values should be removed, which we have done above for clinical columns using na.omit
+
+# Generate the protein expression matrix 
+eset <- as.matrix(t(npx))  # Transpose data
+dim(eset)
+# [1] 2420  183
+
+#Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data, which the NPX values already are
+
+# Limma residuals matrix
+ResidualsMatrix <- residuals(fit1_cov, eset)
+# View(ResidualsMatrix)
+
+dim(ResidualsMatrix)
+#[1] 2420  183
+
+# turn residuals into a data.frame in same order as metadata
+Residualsdf <- data.frame(t(ResidualsMatrix))
+sum(rownames(metadata) == rownames(Residualsdf)) # this should be same as the total no. of individuals
+
+# Rerun PCA after correction
+res.comp <- imputePCA(Residualsdf,ncp=5)
+PCA_after_correction <-  PCA(res.comp,
+                            graph = FALSE, scale.unit = TRUE)
+
+# plot the PCs against selected covariates
+plot_PCA_regression(PCA_after_correction,
+                    meta_data = metadata,
+                    meta_variables = c("AGE", "SEX", "BMI", "BMI_CAT", "ETHNICITY",
+                                       "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                                       "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                                       "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                                       "SMOKING_EVER_T1", "SMOKING_CURRENT", 
+                                       "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                                       "STORAGE_TIME"),
+                    plotname = ti)
+}
+
+# See how corrections influence the data
+design_AGE_STORAGETIME <- model.matrix(~AGE + STORAGE_TIME, data = merge_df)
+
+# for sensitivity analyses
+design_AGE_STORAGETIME_SEX <- model.matrix(~AGE + STORAGE_TIME + SEX, data = merge_df)
+design_AGE_STORAGETIME_ETHNICITYWHITE <- model.matrix(~AGE + STORAGE_TIME + ETHNICITY_WHITE, data = merge_df) ## ethnicity has no unknown in this dataset
+design_AGE_STORAGETIME_ETHNICITYBLACK <- model.matrix(~AGE + STORAGE_TIME + ETHNICITY_BLACK, data = merge_df) ## ethnicity has no unknown in this dataset
+design_AGE_STORAGETIME_CENTEREMC  <- model.matrix(~AGE + STORAGE_TIME + CENTER_EMC, data = merge_df)
+design_AGE_STORAGETIME_CENTEREMCMSZ  <- model.matrix(~AGE + STORAGE_TIME + CENTER_EMC + CENTER_MSZ, data = merge_df)
+design_AGE_STORAGETIME_CENTEROLVG  <- model.matrix(~AGE + STORAGE_TIME + CENTER_OLVG, data = merge_df)
+
+# Nadira's model
+design_AGE_STORAGETIME_CENTER_SEX <- model.matrix(~AGE + STORAGE_TIME + CENTER + SEX, data = merge_df)
+
+# Running the functions
+f(design_AGE_STORAGETIME,"ECVCART_PCA_regression_AGE_STORAGETIME.pdf")
+
+# sensitivity
+f(design_AGE_STORAGETIME_SEX, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_SEX.pdf")
+f(design_AGE_STORAGETIME_ETHNICITYWHITE, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_ETHNICITYWHITE.pdf")
+f(design_AGE_STORAGETIME_ETHNICITYBLACK, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_ETHNICITYBLACK.pdf")
+f(design_AGE_STORAGETIME_CENTEREMC, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_CENTEREMC.pdf")
+f(design_AGE_STORAGETIME_CENTEREMCMSZ, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_CENTEREMCMSZ.pdf")
+f(design_AGE_STORAGETIME_CENTEROLVG, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_CENTEROLVG.pdf")
+
+# Nadira's model
+f(design_AGE_STORAGETIME_CENTER_SEX, "Supplements_ECVCART_PCA_regression_AGE_STORAGETIME_CENTER_SEX.pdf")
+```
+#### Interpretation
+
+The previous model with AGE, SEX, STORAGE_TIME and CENTER results in the most beautiful / cleanest PC regression. However, SEX and CENTER are unchanged between paired comparisons. If SEX and CENTER influence the results, this is either an artifact or it means that the effect of time and ART is different for sexes (could be because dosage relative to weight is usually higher for females) or center. I am not aware of a reason why ART would be more effective in each center.
+
+Main model I believe should be corrected for AGE and STORAGE_TIME. Sensitivity analysis with additional correction for SEX and CENTER.
+
+#### Approaches to paired analysis
+
+1.	Linear mixed models (currently in manuscript): e.g. lme() function from nlme package, as you use.
+  * Main difference with Limma is that the random effects are variable between pairs (SAMPLE_ID) in lme, whereas Limma assumes a fixed effect for pairs, i.e. a pseudorandom effect to account for the correlation between paired samples.
+  * Documentation threads online report that lme can run into problems when one batch is an outlier or if you have some further systematic differences between your batches; and limma has more statistical power. https://support.bioconductor.org/p/96097/ and https://support.bioconductor.org/p/84202/#84205 (about edgeR, but the same arguments apply to limma).
+  * This requires subsetting the data, limiting the maximum desired degrees of freedom.
+
+2. LMM but as a multiple degrees of freedom (df) analysis, see below
+
+3.	Limma using full dataset as in section 9.7 ‘multilevel experiments’, page 51: https://bioconductor.org/packages/release/bioc/vignettes/limma/inst/doc/usersguide.pdf
+  * Join the levels in a single factor GROUP3 as above.
+        •	`design <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX + CENTER, data = merge_df)` # `0+` removes the intercept
+        •	`corfit <- duplicateCorrelation(eset,design,block=targets$ID)` # estimate the correlation between measurements made on the same subject
+        •	`fit <- lmFit(eset,design,block=targets$Subject,correlation=corfit$consensus)` # this correlation is inserted in the model
+        •	`cm <- makeContrasts(EC_ART = GROUP3EC_onART - GROUP3EC_preART, VCpersistent_ART = GROUP3VCpersistent_onART - GROUP3VCpersistent_preART,  VCtransient_ART = GROUP3VCtransient_onART - GROUP3VCtransient_preART, levels = design)`
+        •	`fit2 <- contrasts.fit(fit, cm)`
+        •	`fit2 <- eBayes(fit2)`
+  * This keeps the statistical power of the large dataset, takes into account ID as random variable and covariates.
+
+**I tried out both 1 and 3 to see if results are consistent.**
+
+---------------------------
+ADDENDUM 23/2/2024:
+
+LMM has been reported to be slightly more robust than LIMMA: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9148455/. 
+However, in this paper, they use lmer() and contestMD() from lmerTest package for multiple degree of freedom test.
+
+* LmerTest documentation:  https://cran.r-project.org/web//packages/lmerTest/lmerTest.pdf
+* Limma p 62. 3rd paragraph about moderated F statistic (Smyth) https://bioconductor.org/packages/release/bioc/vignettes/limma/inst/doc/usersguide.pdf
+
+Lmer uses Satterthwaite’s method to calculate F statistic, where as limma calculates moderated F statistic described by Smyth.
+
+In the paper comparing limma and LMM for multiple df testing, the FDR is slightly better in LMM, but the power is very comparable at sample size N=10. My approach with limma below is a form of multiple df testing.
+
+*How to define the random effects?*
+
+The random effects come from the individuals. In our previous LMM, we coded `1|ID` which shifts the intercept for a person, but not the slope. 
+Slope random effects is not a good idea with only two timepoints, since this leads to convergence issues. A minimum of 5 levels per random effect are required: https://stats.stackexchange.com/questions/37647/what-is-the-minimum-recommended-number-of-groups-for-a-random-effects-factor/37665#37665
+
+How to specify the random effects:
+https://stats.stackexchange.com/questions/31569/questions-about-how-random-effects-are-specified-in-lmer
+and p.7 Table 2 on https://cran.r-project.org/web/packages/lme4/vignettes/lmer.pdf 
+
+
+##### Approach 1: lme() from nlme package
+```{r}
+library(nlme)
+# subset VCpersistent
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == "VCpersistent_preART" |
+                                      merge_df$GROUP3 == "VCpersistent_onART"),])
+olinkcolumns <- c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))
+
+# run the mixed linear model regression
+mod2 <- NULL 
+system.time( 
+for (i in olinkcolumns) {
+  regression_formula <- as.formula(paste(names(mergedf1)[i],"~ GROUP3 + AGE + SEX + STORAGE_TIME + CENTER")) # make a formula with the olink column name
+  lmod <- nlme::lme(regression_formula,
+                    random = ~ 1|ID, # the IDs are set as random effect here
+                    data = mergedf1,
+                    na.action=na.omit,
+                    control =list(msMaxIter = 1000, msMaxEval = 1000))
+  
+  # extract statistics
+  stab <- t(summary(lmod)$tTable[2,]) %>% as.data.frame()
+  stab$Covariate <-  "VCpersistent"
+  stab$Outcome <- colnames(merge_df)[i]
+  stab %>%
+    dplyr::select(Outcome, Covariate, everything()) ->
+    stab
+  mod2 <- rbind(mod2, stab)
+})
+mod2$fdr <- p.adjust(mod2$`p-value`, method = 'BH')
+mod2 <- mod2[order(mod2$`p-value`),] # order by P value
+mod2_sig <- mod2[mod2$fdr<0.05,]
+
+paste("Downregulated: ",length(which(mod2_sig$Value<0)),"//",
+      "Upregulated: ", length(which(mod2_sig$Value>0)))
+```
+
+##### Approach 2: LIMMA multilevel
+```{r}
+# remove N=2 with unknown LOSS
+mergedf2 <- merge_df[-which(is.na(merge_df$GROUP3)),]
+design <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX + CENTER, data = mergedf2) # N=2 with GROUP == NA are automatically removed
+npx2 <- mergedf2[which(!is.na(mergedf2$GROUP3)), # remove the GROUP3 = NA, i.e. N=2 with LOSS unknown don't qualify into any subgroup.
+                 c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))] # only Olink columns
+eset2 <- as.matrix(t(npx2))
+dim(eset2) # 2925  288
+
+# estimate the correlation between measurements made on the same subject
+system.time(corfit <- duplicateCorrelation(eset2,design,block=mergedf2$ID))
+
+# fit with ID-correlation inserted
+fit <- lmFit(eset2,design,block=mergedf2$ID,correlation=corfit$consensus)
+cm <- makeContrasts(EC_TIME = GROUP3EC_ARTnaiveT2 - GROUP3EC_ARTnaiveT1,
+                     EC_ART = GROUP3EC_onART - GROUP3EC_preART, 
+                     VCpersistent_TIME = GROUP3VCpersistent_ARTnaiveT2 - GROUP3VCpersistent_ARTnaiveT1,
+                     VCpersistent_ART = GROUP3VCpersistent_onART - GROUP3VCpersistent_preART,
+                     VCtransient_ART = GROUP3VCtransient_onART - GROUP3VCtransient_preART,
+                     levels = design)
+fit2 <- contrasts.fit(fit,cm) 
+fit2 <- eBayes(fit2)
+
+# Display "N" number of differentially expressed proteins
+example <- data.frame(NA,NA,NA,NA,NA,NA,NA)
+colnames(example) <- c("logFC","AveExpr","t","P.Value","adj.P.Val","B","Outcome")
+summarystatistics <- list(example,example,example,example,example)
+names(summarystatistics) <-  c("EC_TIME","EC_ART","VCpersistent_TIME","VCpersistent_ART","VCtransient_ART")
+for (i in  c("EC_TIME","EC_ART","VCpersistent_TIME","VCpersistent_ART","VCtransient_ART")) {
+  DEP_cov <- topTable(fit2, coef = i, adjust = "BH", number = nrow(eset2)) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$P.Val<0.05,] # the FDR-significant proteins
+summarystatistics[[i]] <- DEP_cov
+}
+summarystatistics
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2,adjust.method = "none")
+results_cov_adj <- decideTests(fit2,adjust.method = "BH")
+summary(results_cov)
+summary(results_cov_adj)
+
+
+grep("VAT", mod2$Outcome)
+summarystatistics$VCpersistent_ART[which(summarystatistics$VCpersistent_ART$Outcome=="VAT1"),]
+summarystatistics$VCpersistent_ART[which(summarystatistics$VCpersistent_ART$Outcome=="LY9"),]
+summarystatistics$VCpersistent_ART[which(summarystatistics$VCpersistent_ART$Outcome=="CRTAM"),]
+summarystatistics$VCpersistent_ART[which(summarystatistics$VCpersistent_ART$Outcome=="CD6"),]
+```
+
+**Results are consistent, only LIMMA detects twice as much FDR significant proteins.**
+
+**This is probably a result of the multiple df approach in limma.**
+
+##### Correlation between LIMMA and LMM
+
+```{r}
+# synchronize the two result dataframes
+lmm <- mod2[,-c(2,4,5,6)]
+limma <- summarystatistics$VCpersistent_ART[,-c(2,3,6)]
+
+colnames(lmm) <- c("PROTEIN",paste0(c("LOGFC","RAW_P","FDR_P"),"_LMM"))
+colnames(limma) <- c(paste0(c("LOGFC","RAW_P","FDR_P"),"_LIMMA"),"PROTEIN")
+limma <- limma[,c(4,1,2,3)]
+
+# only the proteins that are FDR significant in LIMMA
+limma <- limma[which(limma$FDR_P_LIMMA <0.05 | limma$PROTEIN == "CLEC6A"),] # CLEC6A is only identified by LMM as significant
+
+# are all LMM significant proteins also identified by LIMMA?
+lmm_significant <- lmm[which(lmm$FDR_P_LMM <0.05),"PROTEIN"]
+limma_significant <- limma[which(limma$FDR_P_LIMMA <0.05),"PROTEIN"]
+length(which(lmm_significant %in% limma_significant))
+lmm_significant[32] # "CLEC6A" # this is the one that is missing in limma_significant
+
+# join together
+result4 <- left_join(limma,lmm, by="PROTEIN")
+head(result4)
+
+### make the correlation plot
+# add a grouping column for coloring by significance; default value is "not significant"
+result4 <- result4 %>% mutate(COLORGROUP = case_when(FDR_P_LIMMA < 0.05 & FDR_P_LMM > 0.05 & RAW_P_LMM < 0.05 ~ "Nominal with LMM",
+                                               FDR_P_LIMMA < 0.05  & FDR_P_LMM < 0.05 ~ "Also FDR with LMM",
+                                               FDR_P_LIMMA < 0.05 & FDR_P_LMM > 0.05 ~ "Only FDR with LIMMA",
+                                               FDR_P_LIMMA > 0.05 & FDR_P_LMM < 0.05 ~ "Only FDR with LMM (n=1)"))
+
+# add a text labels
+for (i in 1:nrow(result4)){
+  if(result4$FDR_P_LIMMA[i] < 0.00001 | #
+     (result4$FDR_P_LMM[i] < 0.05 & result4$FDR_P_LIMMA[i] > 0.05) | # if only FDR with LMM
+     (result4$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1")) # CRTAM, LY9, CD6, VAT1
+     )
+  {result4$LABEL[i] <- result4$PROTEIN[i]} else
+  {result4$LABEL[i] <- ""}}
+
+summary(as.factor(result4$COLORGROUP))
+colnames(result4)
+```
+```{r}
+# plot the data
+# Create a scatter plot
+options(ggrepel.max.overlaps = Inf)
+ggplot(data = result4, aes(x = LOGFC_LIMMA, y = LOGFC_LMM, color = COLORGROUP)) +
+  geom_point(alpha=0.8, size=5) +  # Add the dot plot
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add the correlation line
+  geom_vline(xintercept = 0) + geom_hline(yintercept = 0) +
+  scale_color_manual(values = c("#b2182b","darkblue","#4d4d4d","orange")) + # "orange"
+  ylim(-2, 0.75) + xlim(-2, 0.75) +
+  ylab("Log2 fold change LIMMA") + 
+  xlab("Log2 fold change Linear Mixed Models (LMM)") + 
+  theme_bw() +
+  theme(
+        plot.title=element_text(angle=0, size=20, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=15, vjust=1),
+        axis.text.y=element_text(angle=0, size=15, vjust=1),
+        axis.title=element_text(size=15),
+        legend.position = "left") +
+  ggrepel::geom_label_repel(
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.1, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 8,
+    aes(label = LABEL, hjust = .5), color = "black")
+
+ggsave(paste0(working_dir, "Outputs/Supplements_ECVCART_4Q_LMMvsLIMMA_57VCPERSART_2420_age_sex_ethnicity_storage.pdf"), plot = last_plot(), device = NULL, path = NULL,scale = 1, width = 15, height =12, units = 'in', dpi = 300)
+```
+
+Excellent correlation of fold changes.
+
+
+##### Sensitivity analyses
+
+The effect of `SEX` and `CENTER` can be explored for sensitivity analyses, as well as `ETHNICITY_WHITE.` Note that there are no `ETHNICITY_WHITE == "UNKNOWN"` in this analysis.
+
+```{r}
+# LIMMA
+design <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX + CENTER, data = mergedf2) # N=2 with GROUP == NA are automatically removed
+
+limma_ECVCART <- function(design){
+  # estimate the correlation between measurements made on the same subject
+  system.time(corfit <- duplicateCorrelation(eset2,design,block=mergedf2$ID)) 
+  
+  # fit with ID-correlation inserted
+  fit <- lmFit(eset2,design,block=mergedf2$ID,correlation=corfit$consensus)
+  cm <- makeContrasts(EC_TIME = GROUP3EC_ARTnaiveT2 - GROUP3EC_ARTnaiveT1,
+                       EC_ART = GROUP3EC_onART - GROUP3EC_preART, 
+                       VCpersistent_TIME = GROUP3VCpersistent_ARTnaiveT2 - GROUP3VCpersistent_ARTnaiveT1,
+                       VCpersistent_ART = GROUP3VCpersistent_onART - GROUP3VCpersistent_preART,
+                       VCtransient_ART = GROUP3VCtransient_onART - GROUP3VCtransient_preART,
+                       levels = design)
+  fit2 <- contrasts.fit(fit,cm) 
+  fit2 <- eBayes(fit2)
+  results_cov_adj <- decideTests(fit2,adjust.method = "BH")
+  print(summary(results_cov_adj))
+}
+
+ECVCART_AGE_STORAGE <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME, data = mergedf2)
+ECVCART_AGE_STORAGE_SEX <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX, data = mergedf2)
+ECVCART_AGE_STORAGE_CENTER <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + CENTER, data = mergedf2)
+ECVCART_AGE_STORAGE_SEX_CENTER <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX + CENTER, data = mergedf2)
+
+limma_ECVCART(ECVCART_AGE_STORAGE)
+limma_ECVCART(ECVCART_AGE_STORAGE_SEX)
+limma_ECVCART(ECVCART_AGE_STORAGE_CENTER)
+limma_ECVCART(ECVCART_AGE_STORAGE_SEX_CENTER)
+
+ECVCART_AGE_STORAGE_SEX_CENTER_ETHNICITYWHITE <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX + CENTER + ETHNICITY_WHITE, data = mergedf2)
+limma_ECVCART(ECVCART_AGE_STORAGE_SEX_CENTER_ETHNICITYWHITE)
+
+# LME
+lme_ECVCART <- function(covariates){
+  # run the mixed linear model regression
+mod2 <- NULL 
+system.time( 
+for (i in olinkcolumns) {
+  regression_formula <- as.formula(paste(names(mergedf1)[i],"~ GROUP3 +", covariates)) # make a formula with the olink column name
+  lmod <- nlme::lme(regression_formula,
+                    random = ~ 1|ID, # the IDs are set as random effect here
+                    data = mergedf1,
+                    na.action=na.omit,
+                    control =list(msMaxIter = 1000, msMaxEval = 1000))
+  
+  # extract statistics
+  stab <- t(summary(lmod)$tTable[2,]) %>% as.data.frame()
+  stab$Covariate <-  "VCpersistent"
+  stab$Outcome <- colnames(merge_df)[i]
+  stab %>%
+    dplyr::select(Outcome, Covariate, everything()) ->
+    stab
+  mod2 <- rbind(mod2, stab)
+})
+mod2$fdr <- p.adjust(mod2$`p-value`, method = 'BH')
+mod2 <- mod2[order(mod2$`p-value`),] # order by P value
+mod2_sig <- mod2[mod2$fdr<0.05,]
+
+print(paste("Downregulated: ",length(which(mod2_sig$Value<0)),"//",
+      "Upregulated: ", length(which(mod2_sig$Value>0))))
+}
+
+lme_ECVCART("AGE + STORAGE_TIME")
+lme_ECVCART("AGE + STORAGE_TIME + SEX")
+lme_ECVCART("AGE + STORAGE_TIME + CENTER")
+lme_ECVCART("AGE + STORAGE_TIME + SEX + CENTER")
+lme_ECVCART("AGE + STORAGE_TIME + ETHNICITY_WHITE")
+lme_ECVCART("AGE + STORAGE_TIME + SEX + CENTER + ETHNICITY_WHITE")
+
+```
+##### Run final model
+
+Interestingly, an additional +-30 proteins (LIMMA) or 2 (LME) become FDR significant if we include CENTER. In my opinion, this could be an artefact, since the distribution of EC, VCpersistent and VCtransient is skewed across the centers and correcting for center might overestimate the effect of ART. SEX doesn't change the results.
+
+I prefer using Limma with AGE and STORAGE_TIME as confounders, because of:
+* lower degrees of freedom with limited sample size
+* Limma has more statistical power
+* we do not have clear indications that we need linear mixed model
+* SEX and CENTER are unchanged within pairs, and correcting for SEX doesn't matter and for CENTER introduces an unexpected increase in FDR-significant proteins, that is difficult to interpret.
+
+**ADDENDUM 27/2/2023**
+
+Discussed with Nadira, and the preference is for VC to correct for SEX and CENTER as well, to avoid any imbalances between the pairs. For EC, sample size does not allow for it.
+
+Preference is to use LME, because it is more conventional and we can be sure about the proteins that are FDR significant.
+
+```{r}
+example <- data.frame(NA,NA,NA,NA,NA,NA,NA,NA)
+colnames(example) <- c("Outcome","Covariate","Value","Std.Error","DF","t-value","p-value","fdr")
+summarystatistics <- list(example,example,example,example,example)
+names(summarystatistics) <-  c("EC_TIME","EC_ART","VCpersistent_TIME","VCpersistent_ART","VCtransient_ART")
+
+lmm_on_subset <- function(analysisname, treatment, reference, covar_text) {
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == treatment|
+                                      merge_df$GROUP3 == reference),])
+olinkcolumns <- c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))
+
+# run the mixed linear model regression
+mod2 <- NULL 
+system.time( 
+for (i in olinkcolumns) {
+  regression_formula <- as.formula(paste(names(mergedf1)[i],"~ GROUP3 +",covar_text)) # make a formula with the olink column name
+  lmod <- nlme::lme(regression_formula,
+                    random = ~ 1|ID, # the IDs are set as random effect here
+                    data = mergedf1,
+                    na.action=na.omit,
+                    control =list(msMaxIter = 1000, msMaxEval = 1000))
+  
+  # extract statistics
+  stab <- t(summary(lmod)$tTable[2,]) %>% as.data.frame()
+  stab$Covariate <-  analysisname
+  stab$Outcome <- colnames(merge_df)[i]
+  stab %>%
+    dplyr::select(Outcome, Covariate, everything()) ->
+    stab
+  mod2 <- rbind(mod2, stab)
+})
+mod2$fdr <- p.adjust(mod2$`p-value`, method = 'BH')
+mod2 <- mod2[order(mod2$`p-value`),] # order by P value
+
+return (mod2)
+}
+
+summarystatistics[["EC_TIME"]] <- lmm_on_subset("EC_TIME", "EC_ARTnaiveT2", "EC_ARTnaiveT1", "AGE + STORAGE_TIME")
+summarystatistics[["EC_ART"]] <- lmm_on_subset("EC_ART", "EC_onART", "EC_preART", "AGE + STORAGE_TIME")
+summarystatistics[["VCpersistent_TIME"]] <- lmm_on_subset("VCpersistent_TIME", "VCpersistent_ARTnaiveT2", "VCpersistent_ARTnaiveT1", "AGE + SEX + STORAGE_TIME + CENTER")
+summarystatistics[["VCpersistent_ART"]] <- lmm_on_subset("VCpersistent_ART", "VCpersistent_onART", "VCpersistent_preART", "AGE + SEX + STORAGE_TIME + CENTER")
+summarystatistics[["VCtransient_ART"]] <- lmm_on_subset("VCtransient_ART", "VCtransient_onART", "VCtransient_preART", "AGE + SEX + STORAGE_TIME + CENTER")
+
+summarystatistics
+
+# change list names so it includes sample size: 
+names(summarystatistics) <- paste0(names(summarystatistics),"_",c("19","9","23","57","36"))
+# c("EC_TIME_19","EC_ART_9","VCpersistent_TIME_23","VCpersistent_ART_57","VCtransient_ART_36")
+
+openxlsx::write.xlsx(summarystatistics,paste0(working_dir,"Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"))
+
+```
+
+Also with LIMMA for completeness of script. We may come back to it later.
+```{r}
+# remove the N=2 with GROUP == NA again
+mergedf2 <- merge_df[-which(is.na(merge_df$GROUP3)),]
+# Create model design formula
+design <- model.matrix(~ 0 + GROUP3 + AGE + STORAGE_TIME + SEX + CENTER, data = mergedf2) # N=2 with GROUP == NA are automatically removed
+npx2 <- mergedf2[which(!is.na(mergedf2$GROUP3)), # remove the GROUP3 = NA, i.e. N=2 with LOSS unknown don't qualify into any subgroup.
+                 c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))] # only Olink columns
+eset2 <- as.matrix(t(npx2))
+dim(eset2) # 2925  288
+
+# estimate the correlation between measurements made on the same subject
+system.time(corfit <- duplicateCorrelation(eset2,design,block=mergedf2$ID)) 
+
+# fit with ID-correlation inserted
+fit <- lmFit(eset2,design,block=mergedf2$ID,correlation=corfit$consensus)
+cm <- makeContrasts(EC_TIME = GROUP3EC_ARTnaiveT2 - GROUP3EC_ARTnaiveT1,
+                     EC_ART = GROUP3EC_onART - GROUP3EC_preART, 
+                     VCpersistent_TIME = GROUP3VCpersistent_ARTnaiveT2 - GROUP3VCpersistent_ARTnaiveT1,
+                     VCpersistent_ART = GROUP3VCpersistent_onART - GROUP3VCpersistent_preART,
+                     VCtransient_ART = GROUP3VCtransient_onART - GROUP3VCtransient_preART,
+                     levels = design)
+fit2 <- contrasts.fit(fit,cm) 
+fit2 <- eBayes(fit2)
+
+# Display "N" number of differentially expressed proteins
+example <- data.frame(NA,NA,NA,NA,NA,NA,NA)
+colnames(example) <- c("logFC","AveExpr","t","P.Value","adj.P.Val","B","Outcome")
+summarystatistics <- list(example,example,example,example,example)
+names(summarystatistics) <-  c("EC_TIME","EC_ART","VCpersistent_TIME","VCpersistent_ART","VCtransient_ART")
+for (i in  c("EC_TIME","EC_ART","VCpersistent_TIME","VCpersistent_ART","VCtransient_ART")) {
+  DEP_cov <- topTable(fit2, coef = i, adjust = "BH", number = nrow(eset2)) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$P.Val<0.05,] # the FDR-significant proteins
+summarystatistics[[i]] <- DEP_cov
+}
+summarystatistics
+
+# change list names so it includes sample size: 
+names(summarystatistics) <- paste0(names(summarystatistics),"_",c("19","9","23","57","36"))
+# c("EC_TIME_19","EC_ART_9","VCpersistent_TIME_23","VCpersistent_ART_57","VCtransient_ART_36")
+
+# write the summary statistics to excel table, with each comparison on a different sheet.
+openxlsx::write.xlsx(summarystatistics,paste0(working_dir,"Outputs/Supplements_LIMMA_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"))
+```
+
+#### Figure 2A - volcano VCpersistent
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCpersistent_ART_57")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.01', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$FDR_P[i] < 0.01 | # 'FDR-P <0.01'
+     (diff_df$FDR_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(FDR_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("#b2182b","orange","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 FDR P value") +
+  ggtitle("57 persistent VC paired samples before and after ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 3, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3) + ylim(0,3.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+ggsave(paste0(working_dir, "Outputs/ECVCART_Volcano_label_0.01FDRP_2FC_57VCpersistent_ART_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL, width = 4, height =4, units = 'in', dpi = 300)
+
+# Check direction:
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == "VCpersistent_preART" |
+                                      merge_df$GROUP3 == "VCpersistent_onART"),])
+boxplot(mergedf1$CD6~as.factor(mergedf1$GROUP3))
+boxplot(mergedf1$LY9~as.factor(mergedf1$GROUP3)) 
+```
+#### Figure 2B - 4quadrant VCpersistent ART & TIME
+
+```{r}
+# read the summary statistics for VC persistent
+result_art <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCpersistent_ART_57")
+result_art <- result_art[,c("Outcome","p-value","fdr","Value")]
+colnames(result_art) <- c("PROTEIN","RAW_P_ART", "FDR_P_ART","LOG_FC_ART")
+
+# read the summary statistics for VC persistent over TIME
+result_time <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCpersistent_TIME_23")
+result_time <- result_time[,c("Outcome","p-value","fdr","Value")]
+colnames(result_time) <- c("PROTEIN","RAW_P_TIME", "FDR_P_TIME","LOG_FC_TIME")
+
+# combine the two
+result3 <- merge(result_art, result_time, by = "PROTEIN")
+result3 <- result3[order(result3$RAW_P_ART),]
+
+# add a grouping column for coloring by significance; default value is "not significant"
+result3 <- result3 %>% mutate(COLORGROUP = case_when(FDR_P_ART < 0.05 & ((RAW_P_TIME > 0.05) | ((LOG_FC_ART > 0) != (LOG_FC_TIME > 0))) ~ "Effect_of_ART",
+                                               RAW_P_TIME < 0.05 & (LOG_FC_ART > 0) == (LOG_FC_TIME > 0)~ "Influenced_by_time",
+                                               RAW_P_TIME > 0.05 | FDR_P_ART > 0.05 ~ "NotSignificant"
+                                               ))
+
+# remove non-significant proteins over ART
+result3 <- result3[-which(result3$FDR_P_ART > 0.05 & result3$PROTEIN != "CRTAM"),]
+
+# add a text labels
+for (i in 1:nrow(result3)){
+  if(result3$FDR_P_ART[i] < 0.01 | #
+     (result3$RAW_P_TIME[i] < 0.05) | # add label if raw P significant over time
+     (result3$FDR_P_ART[i] < 0.05 & abs(result3$LOG_FC_ART[i]) > 2 | #
+     (result3$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {result3$LABEL[i] <- result3$PROTEIN[i]} else
+  {result3$LABEL[i] <- ""}}
+
+levels(as.factor(result3$COLORGROUP))
+
+# plot the data
+# Create a scatter plot
+options(ggrepel.max.overlaps = Inf)
+ggplot(data = result3, aes(x = LOG_FC_ART, y = LOG_FC_TIME, color = COLORGROUP)) +
+  geom_point(alpha=0.8, size=2) +  # Add the dot plot
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add the correlation line
+  geom_vline(xintercept = 0) + geom_hline(yintercept = 0) +
+  scale_color_manual(values = c("#b2182b","orange"), name = "") + # "orange"
+  ylim(-1.75, 0.5) + xlim(-1.75, 0.5) +
+  ylab("Log2 fold change over TIME, ART-naive") + 
+  xlab("Log2 fold change before and after ART") + 
+  theme_bw() +
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  ggrepel::geom_label_repel(
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.1, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75,
+    aes(label = LABEL, hjust = .5), color = "black")
+
+ggsave(paste0(working_dir, "Outputs/ECVCART_4Q_label_0.001FDRPART_2FC_0.05RAWPTIME_57VCPERSART_23VCPERSTIME_2420_age_storage.pdf"), plot = last_plot(), device = NULL, path = NULL,scale = 1, width = 3.5, height = 3, units = 'in', dpi = 300)
+```
+
+
+#### Figure 2C  - volcano VCtransient
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCtransient_ART_36")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.001 | # 'FDR-P <0.05'
+     (diff_df$FDR_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("#b2182b","orange","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("36 transient VC paired samples before and after ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3) + ylim(0, 6) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept= log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/ECVCART_Volcano_label_0.001FDRP_2FC_36VCtransient_ART_2420_age_storage.pdf"), plot = g, width = 4, height =4, units = 'in', dpi = 300)
+```
+
+#### Figure 2D - volcano ECpersistent
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "EC_ART_9")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.01 | # 'FDR-P <0.05'
+     (diff_df$FDR_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + # no red because no FDR significant
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("9 persistent EC paired samples before and after ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3.4) + ylim(0, 4.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept= -log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/ECVCART_Volcano_label_0.001RAWP_2FC_9EC_ART_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL,scale = 1, width = 4, height =4, units = 'in', dpi = 300)
+```
+
+#### Suppl. Figure S3B - volcano VCpersistent over TIME
+```{r}
+# read the summary statistics for VC persistent over TIME
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCpersistent_TIME_23")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.01 | # 'FDR-P <0.05'
+     (diff_df$FDR_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + # no red because no FDR significant
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("23 persistent VC paired samples over time, ART-naive" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3.4) + ylim(0, 4.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept= -log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/Supplements_ECVCART_Volcano_label_0.01RAWP_2FC_23VC_TIME_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL,scale = 1, width = 4, height = 4, units = 'in', dpi = 300)
+```
+
+#### Suppl. Figure S3C - volcano ECpersistent over TIME
+
+```{r}
+# read the summary statistics for EC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "EC_TIME_19")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'RAW_P < 0.001', or if 'RAW_P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.01 | # 
+     (diff_df$RAW_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | #
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + # no red because no FDR significant
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("19 persistent EC paired samples over time, ART-naive" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3.4) + ylim(0, 4.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept= -log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g 
+ggsave(paste0(working_dir, "Outputs/Supplements_ECVCART_Volcano_label_0.01RAWP_2FC_19EC_TIME_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL,scale = 1, width = 4, height =4, units = 'in', dpi = 300)
+```
+#### Figure 2E, pathway analysis of 101 downregulated proteins in VCpersistent after ART
+
+**ADDENDUM 27-2-2024:**
+
+We decided to show the cytoscape pathway network, of the 47 LMM FDR-significant downregulated proteins.
+
+```{r}
+pathways <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/PATHWAY_LIMMA_Olink_ECVC_ARTandTIME_2420_age_storage.xlsx"), sheet = "GOBP_KEGG_REACTOME")
+
+colnames(pathways)
+head(pathways)
+# Clean up pathway name
+stringr::str_split_i(pathways$Term,"~",2)
+which(pathways$Category =="GOTERM_BP_DIRECT" |
+      pathways$Category == "REACTOME_PATHWAY")
+
+pathways <- pathways %>% mutate(NAME = case_when(Category =="GOTERM_BP_DIRECT" | Category == "REACTOME_PATHWAY" ~ 
+                                       stringr::str_split_i(Term,"~",2),
+                                     Category =="KEGG_PATHWAY" ~ stringr::str_split_i(Term,":",2)))
+
+stringr::str_split_i(pathways$Term,":",2)
+which(pathways$Category == "KEGG_PATHWAY")
+#
+pathways$NAME <- paste0(pathways$Category, ": ", pathways$NAME)
+pathways <- pathways[order(pathways$FDR),]
+pathways <- pathways[c(1:10),]
+
+
+colnames(pathways)
+#####
+library(RColorBrewer)
+
+levels_orders <- pathways$NAME
+
+pathways$NAME <- factor(pathways$NAME, levels = levels_orders)
+pathways$minlog10FDR <- -log10(pathways$FDR)
+
+ggplot(data = pathways, aes(x = rev(NAME), y = Fold.Enrichment, fill = minlog10FDR)) +
+  geom_bar(stat = "identity") +
+  theme_bw() + xlab("") + ylab("Fold Enrichment ") +
+  theme(axis.text.y = element_text(color = "black", size = 10),
+        axis.text.x = element_text(color = "black", size = 8),
+        axis.title = element_text(color = "black", size = 10),
+        legend.text = element_text(color = "black", size = 8),
+        legend.title = element_text(color = "black", size = 10),
+        legend.position = 'right') +
+  coord_flip() + scale_fill_gradientn(colors = c("#74A9CF","#3690C0","#0570B0","#045A8D","#023858")) 
+
+ggsave(paste0(working_dir, "Outputs/Supplements_PATHWAY_barplot_VCpersistent_ART_DOWN.pdf"), width = 9, height = 2.75, units = "in", dpi = 300)
+```
+
+
+#### Suppl. Figure S3A - PCA plots
+
+We need several PC plots: pre and post ART (all participants), ART duration category (all participants), INSTI_yesno, NNRTI_yesno, PI_yesno.
+
+Since we identify the need for correcting our data, it is more meaningful to plot the PC1 and PC2 of the residuals, since the point of the figure is to show whether there are differences by ART and ART duration and regimes.
+
+We can make one PCA of all paired pre/post ART samples.To the metadata we need to add ART duration and ART regime.
+
+```{r}
+merge_df <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Time_ART_Paired_Cleaned.rds"))
+summary(as.factor(merge_df$ART))
+summary(as.factor(merge_df$GROUP3))
+dfart <- droplevels(merge_df[which(merge_df$ART == 1),])
+# remove the N=2 with loss status unknown
+dfart <- dfart[-which(is.na(dfart$GROUP3)),]
+summary(as.factor(dfart$GROUP3))
+summary(as.factor(dfart$Timepoint)) # pre and post ART
+
+npxart <- dfart[,c(grep("GP2", colnames(dfart)):grep("NFU1", colnames(dfart)))]
+
+# add categorical ART duration
+dfart <- dfart %>% mutate(ART_DUR_cat = case_when(T2_ART_DUR_DAYS < 365 ~ "<1year",
+                                 T2_ART_DUR_DAYS >= 365 & T2_ART_DUR_DAYS < 1825 ~ "1-5years",
+                                 T2_ART_DUR_DAYS >= 1825 & T2_ART_DUR_DAYS < 3650 ~ "5-10years",
+                                 T2_ART_DUR_DAYS >= 3650 ~ ">=10years"))
+dfart$ART_DUR_cat <- factor(dfart$ART_DUR_cat, levels = c("<1year","1-5years","5-10years",">=10years"))
+
+# extract residuals after correcting for AGE, and STORAGE_TIME with LIMMA
+# Generate the protein expression matrix 
+eset <- as.matrix(t(npxart))  # Transpose data
+dim(eset) # [1] 2420  183
+# Design matrix
+design_cov <- model.matrix(~ 0 + AGE + STORAGE_TIME, data = dfart)
+#Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data, which the NPX values already are
+# Limma residuals matrix
+ResidualsMatrix <- residuals(fit1_cov, eset)
+
+# store residuals in new dataframe for S2D
+npx_s3a <- data.frame(t(ResidualsMatrix))
+sum(rownames(dfart) == rownames(npx_s3a))
+prin_comp <- prcomp(npx_s3a, center = T,scale. = T) # In Nadira's script, it was  `scale. = False`, although in the PC regressions and in Vicky's example script, we set scale.unit in PCA() always to True. Here I also set `scale. = T`.
+summary(prin_comp)$importance[2,c(1:5)]
+
+# PCA Plot
+ ggbiplot(prin_comp, obs.scale = 1, var.scale = 1,
+              #labels = rownames(prin_comp$x),
+              groups = as.factor(dfart$Timepoint),
+              circle = F, ellipse = T, var.axes = F,
+              alpha = 0.5,ellipse.fill = "none",ellipse.linewidth = 0.5)+
+  #geom_point(shape=as.factor(df_m_1$NONVIREMIC),
+  #           aes(colour=as.factor(master_df$VL_cat)),
+  #           alpha = .5,
+  #           size=1.5)+
+  scale_color_manual(values = c("darkgrey","#b2182b"),name = "Pre/post ART") +
+  theme(legend.direction = 'horizontal',
+        legend.position = 'top')+
+  theme_bw(base_size=10)+
+  labs(title ="") + ylim(-60,60) + xlim(-80,80)
+
+ggsave(paste0(working_dir,"Outputs/Supplements_FigureS3A_PCAresiduals_plot_ART_102_102samp_2420proteins.pdf"), dpi = 300, width = 11.25, height = 10, units = "cm" )
+
+## statistics:
+
+############
+### PCA Plot ART types
+# subset only the T2 samples
+dim(npx_s3a)
+npx_s3_artonly <- npx_s3a[-which(is.na(dfart$T2_ART_DUR_DAYS)),]
+dfart_artonly <- dfart[-which(is.na(dfart$T2_ART_DUR_DAYS)),]
+sum(rownames(dfart_artonly) == rownames(npx_s3_artonly))
+prin_comp2 <- prcomp(npx_s3_artonly, center = T,scale. = T) # In Nadira's script, it was  `scale. = False`, although in the PC regressions and in Vicky's example script, we set scale.unit in PCA() always to True. Here I also set `scale. = T`.
+summary(prin_comp2)$importance[2,c(1:5)]
+
+# define function for PCA plot
+f_pca_art <- function(variable) {
+g <- ggbiplot(prin_comp2, obs.scale = 1, var.scale = 1,
+              groups = as.factor(dfart_artonly[,variable]),
+              circle = F, ellipse = T, var.axes = F,
+              alpha = 0.5,ellipse.fill = "none",ellipse.linewidth = 0.5)+
+  scale_color_manual(values = c("darkgrey","darkgreen","darkorange","darkred"),name = variable) +
+  theme_bw(base_size=8)+
+  theme(legend.direction = 'horizontal',
+        legend.position = "bottom")+
+  labs(title ="") + ylim(-60,60) + xlim(-90,90)
+print(g)
+  ggsave(paste0(working_dir, "Outputs/Supplements_FigureS3A_PCAresiduals_plot_",variable,"_102samp_2420proteins.pdf"), g, dpi = 300, width = 6, height = 6, units = "cm" )
+}
+
+f_pca_art("ART_DUR_cat")
+f_pca_art("T2_INSTI")
+f_pca_art("T2_NNRTI")
+f_pca_art("T2_PI")
+```
+
+
+##### Calculate P values for shift in PC1 and PC2 pre/post ART
+
+Since I use here the pca of the residuals, the P values are different. In fact, they are no longer significant, suggesting that the effect of ART is very specific on these 100 or so proteins that are downregulated, that have to do mainly with T cell activation and turnover.
+
+Note that the code below is Nadira's, and can also be used to display density plots on the axes of the PC plot.
+```{r}
+#### STATISTICS PC1 and PC2 Pvalue pre-post ART (204 paired samples of 102 individuals)
+library(plyr)
+library(rstatix)
+library(ggpubr)
+
+data_pca <- as.data.frame(prin_comp$x[,1:4])
+data_pca$Cohort <- dfart$Timepoint
+
+makeStars <- function(x){
+  stars <- c( "***", "**", "*", "ns")
+  vec <- c(0, 0.0005, 0.005, 0.05, 1)
+  i <- findInterval(x, vec)
+  stars[i]
+}
+
+mu <- ddply(data_pca, "Cohort", summarise, grp.mean=mean(PC1))
+stat.test_1 <- data_pca %>% wilcox_test(PC1 ~ Cohort)
+stat.test_1 <- stat.test_1 %>% add_xy_position(fun = "mean_sd", x = "Cohort") %>%
+  mutate(signif = makeStars(p))
+
+mu_2 <- ddply(data_pca, "Cohort", summarise, grp.mean=mean(PC2))
+stat.test_2 <- data_pca %>% wilcox_test(PC2 ~ Cohort)
+stat.test_2 <- stat.test_2 %>% add_xy_position(fun = "mean_sd", x = "Cohort")%>%
+  mutate(signif = makeStars(p))
+
+rbind(stat.test_1, stat.test_2)
+```
+
+
+
+
+
+
+

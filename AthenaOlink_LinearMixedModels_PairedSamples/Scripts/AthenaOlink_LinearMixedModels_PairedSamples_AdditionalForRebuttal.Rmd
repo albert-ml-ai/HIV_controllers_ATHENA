@@ -1,0 +1,670 @@
+---
+title: "251014_AgeMatchedPaired"
+output: html_document
+author: "Albert Groenendijk"
+date: "2025-10-14"
+---
+
+A spin-off from the main notebook `AthenaOlink_LinearMixedModels_PairedSamples.Rmd`
+
+The reviewer points out the absolute age differences between EC, persistent VC and transient VC.
+To address this, we age-match the groups to EC  and redo the paired before/after comparisons with nlme. 
+
+## MATCHING
+### Summary of group sizes
+
+* n=57 persistent VC who start ART
+* n=36 Transient VC who start ART
+* n=9 EC who start ART
+* Additionally 19 EC and 23 VC are included who have paired samples
+
+```{r echo=T, results='hide', warning=F,message=F}
+working_dir <- c("HIV_controllers_ATHENA/AthenaOlink_LinearMixedModels_PairedSamples/")
+
+library(FactoMineR)
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(table1)
+library(ggbiplot)
+library(ggplot2)
+library(openxlsx)
+library(limma)
+library(tidyverse)
+library(ggrepel)
+library(nlme)
+
+merge_df <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Time_ART_Paired_Cleaned.rds"))
+merge_df <- droplevels(merge_df[which(merge_df$ART==1 & !is.na(merge_df$GROUP3)),])
+summary(merge_df$GROUP3)
+
+ecvcpers <- droplevels(merge_df[which(merge_df$GROUP3 %in% c("EC_onART", "VCpersistent_onART")),])
+ecvcpers$GROUP3 <- relevel(ecvcpers$GROUP3, "VCpersistent_onART")
+summary(ecvcpers$GROUP3) 
+ecvctrans <- droplevels(merge_df[which(merge_df$GROUP3 %in% c("EC_onART", "VCtransient_onART")),])
+ecvctrans$GROUP3 <- relevel(ecvctrans$GROUP3, "VCtransient_onART")
+summary(ecvctrans$GROUP3)
+```
+
+#### AGE Matching
+Source: https://cran.r-project.org/web/packages/MatchIt/vignettes/MatchIt.html
+```{r}
+library(MatchIt)
+
+## ECVCPERS
+# No matching; constructing a pre-match matchit object
+m.out0 <- matchit(GROUP3 ~ AGE, data = ecvcpers,
+                 method = NULL, distance = "glm")
+summary(m.out0)
+
+# plot(m.out0, type = "jitter", interactive = FALSE)
+plot(m.out0, type = "density", interactive = FALSE,
+     which.xs = ~AGE )
+
+## ECVCTRANS
+# No matching; constructing a pre-match matchit object
+m.out0 <- matchit(GROUP3 ~ AGE, data = ecvctrans,
+                 method = NULL, distance = "glm")
+summary(m.out0)
+
+# plot(m.out0, type = "jitter", interactive = FALSE)
+plot(m.out0, type = "density", interactive = FALSE,
+     which.xs = ~AGE )
+
+```
+
+```{r}
+#### ECVCpers
+# 1:n Nearest neighbour (NN) propensity score (PS) matching w/o replacement
+m.out1 <- matchit(GROUP3 ~ AGE, data = ecvcpers,
+                 method = "nearest", distance = "glm", ratio = 2)
+summary(m.out1)
+
+plot(m.out1, type = "jitter", interactive = FALSE)
+plot(m.out1, type = "density", interactive = FALSE,
+     which.xs = ~AGE)
+
+# matched dataset:
+ecvcpers_matched <- match.data(m.out1)
+summary(ecvcpers_matched$subclass)
+
+### ECVCtrans
+# 1:n Nearest neighbour (NN) propensity score (PS) matching w/o replacement
+m.out1 <- matchit(GROUP3 ~ AGE, data = ecvctrans,
+                 method = "nearest", distance = "glm", ratio = 2)
+summary(m.out1)
+
+plot(m.out1, type = "jitter", interactive = FALSE)
+plot(m.out1, type = "density", interactive = FALSE,
+     which.xs = ~AGE)
+
+# matched dataset:
+ecvctrans_matched <- match.data(m.out1)
+summary(ecvcpers_matched$subclass)
+
+keep_ids <- unique(c(ecvcpers_matched$ID, ecvctrans_matched$ID))
+matched_df <- merge_df[which(merge_df$ID %in% keep_ids),]
+summary(matched_df$GROUP3)
+
+# ages table
+summary_table <- matched_df %>%
+  group_by(GROUP3) %>%
+  summarise(val = paste0(round(median(AGE, na.rm = TRUE),1), " (", round(IQR(AGE, na.rm = TRUE),1), ")")) %>%
+  pivot_wider(names_from = GROUP3, values_from = val) %>%
+  mutate(stat = "median age (IQR)") %>%
+  select(stat, everything())
+
+# Display summary_table
+print(summary_table)
+
+```
+
+
+##### Run lmm
+```{r}
+merge_df <- matched_df
+
+example <- data.frame(NA,NA,NA,NA,NA,NA,NA,NA)
+colnames(example) <- c("Outcome","Covariate","Value","Std.Error","DF","t-value","p-value","fdr")
+summarystatistics <- list(example,example,example)
+names(summarystatistics) <-  c("EC_ART","VCpersistent_ART","VCtransient_ART")
+
+lmm_on_subset <- function(analysisname, treatment, reference, covar_text) {
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == treatment|
+                                      merge_df$GROUP3 == reference),])
+olinkcolumns <- c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))
+
+# run the mixed linear model regression
+mod2 <- NULL 
+system.time( 
+for (i in olinkcolumns) {
+  regression_formula <- as.formula(paste(names(mergedf1)[i],"~ GROUP3 +",covar_text)) # make a formula with the olink column name
+  lmod <- nlme::lme(regression_formula,
+                    random = ~ 1|ID, # the IDs are set as random effect here
+                    data = mergedf1,
+                    na.action=na.omit,
+                    control =list(msMaxIter = 1000, msMaxEval = 1000))
+  
+  # extract statistics
+  stab <- t(summary(lmod)$tTable[2,]) %>% as.data.frame()
+  stab$Covariate <-  analysisname
+  stab$Outcome <- colnames(merge_df)[i]
+  stab %>%
+    dplyr::select(Outcome, Covariate, everything()) ->
+    stab
+  mod2 <- rbind(mod2, stab)
+})
+mod2$fdr <- p.adjust(mod2$`p-value`, method = 'BH')
+mod2 <- mod2[order(mod2$`p-value`),] # order by P value
+
+return (mod2)
+}
+
+summarystatistics[["EC_ART"]] <- lmm_on_subset("EC_ART", "EC_onART", "EC_preART", "AGE + STORAGE_TIME")
+summarystatistics[["VCpersistent_ART"]] <- lmm_on_subset("VCpersistent_ART", "VCpersistent_onART", "VCpersistent_preART", "AGE + SEX + STORAGE_TIME + CENTER")
+summarystatistics[["VCtransient_ART"]] <- lmm_on_subset("VCtransient_ART", "VCtransient_onART", "VCtransient_preART", "AGE + SEX + STORAGE_TIME + CENTER")
+
+summarystatistics
+
+# change list names so it includes sample size: 
+names(summarystatistics) <- paste0(names(summarystatistics),"_",c("9","18","18"))
+# c("EC_TIME_19","EC_ART_9","VCpersistent_TIME_23","VCpersistent_ART_57","VCtransient_ART_36")
+
+openxlsx::write.xlsx(summarystatistics,paste0(working_dir,"Outputs/RebuttalAddition_AGEMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"))
+
+```
+
+#### RebuttalFigure - volcano VCpersistent
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/RebuttalAddition_AGEMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCpersistent_ART_18")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.01', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.001 | # 'FDR-P <0.01'
+     (diff_df$RAW_P[i] < 0.01 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("18 persistent VC paired samples ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 3, aes(label = LABEL,hjust = .5))+
+  #xlim(-5,3) + ylim(0,1.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+ggsave(paste0(working_dir, "Outputs/RebuttalAdition_ECVCART_Volcano_label_0.01FDRP_2FC_57VCpersistent_ART_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL, width = 4, height =4, units = 'in', dpi = 300)
+
+# Check direction:
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == "VCpersistent_onART"|
+                                      merge_df$GROUP3 == "VCpersistent_preART"),])
+boxplot(mergedf1$CD6~as.factor(mergedf1$GROUP3))
+boxplot(mergedf1$LY9~as.factor(mergedf1$GROUP3)) 
+```
+
+#### RebuttalFigure  - volcano VCtransient
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/RebuttalAddition_AGEMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCtransient_ART_18")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.001 | # 'FDR-P <0.05'
+     (diff_df$RAW_P[i] < 0.01 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("18 transient VC paired samples ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  #xlim(-4.1,3) + ylim(0, 6) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) #+ # Add a vertical line for Estimate change cut-offs
+  #geom_hline(yintercept= log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/RebuttalAdditionECVCART_Volcano_label_0.001FDRP_2FC_36VCtransient_ART_2420_age_storage.pdf"), plot = g, width = 4, height =4, units = 'in', dpi = 300)
+```
+
+#### RebuttalFigure - volcano ECpersistent
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/RebuttalAddition_AGEMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "EC_ART_9")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.01 | # 'FDR-P <0.05'
+     (diff_df$FDR_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + # no red because no FDR significant
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("9 persistent EC paired samples ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3.4) + ylim(0, 4.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept= -log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/RebuttalAddtion_ECVCART_Volcano_label_0.001RAWP_2FC_9EC_ART_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL,scale = 1, width = 4, height =4, units = 'in', dpi = 300)
+```
+
+####
+####
+####
+### ART-duration MATCHED comparisons
+```{r}
+merge_df <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Time_ART_Paired_Cleaned.rds"))
+merge_df <- droplevels(merge_df[which(merge_df$ART==1 & !is.na(merge_df$GROUP3)),])
+summary(merge_df$GROUP3)
+
+ecvcpers <- droplevels(merge_df[which(merge_df$GROUP3 %in% c("EC_onART", "VCpersistent_onART")),])
+ecvcpers$GROUP3 <- relevel(ecvcpers$GROUP3, "VCpersistent_onART")
+summary(ecvcpers$GROUP3) 
+ecvctrans <- droplevels(merge_df[which(merge_df$GROUP3 %in% c("EC_onART", "VCtransient_onART")),])
+ecvctrans$GROUP3 <- relevel(ecvctrans$GROUP3, "VCtransient_onART")
+summary(ecvctrans$GROUP3)
+summary(merge_df$T2_ART_DUR_DAYS)
+```
+#### AGE Matching
+Source: https://cran.r-project.org/web/packages/MatchIt/vignettes/MatchIt.html
+```{r}
+library(MatchIt)
+merge_df
+## ECVCPERS
+# No matching; constructing a pre-match matchit object
+m.out0 <- matchit(GROUP3 ~ T2_ART_DUR_DAYS, data = ecvcpers,
+                 method = NULL, distance = "glm")
+summary(m.out0)
+
+# plot(m.out0, type = "jitter", interactive = FALSE)
+plot(m.out0, type = "density", interactive = FALSE,
+     which.xs = ~T2_ART_DUR_DAYS )
+
+## ECVCTRANS
+# No matching; constructing a pre-match matchit object
+m.out0 <- matchit(GROUP3 ~ T2_ART_DUR_DAYS, data = ecvctrans,
+                 method = NULL, distance = "glm")
+summary(m.out0)
+
+# plot(m.out0, type = "jitter", interactive = FALSE)
+plot(m.out0, type = "density", interactive = FALSE,
+     which.xs = ~T2_ART_DUR_DAYS )
+
+```
+
+```{r}
+#### ECVCpers
+# 1:n Nearest neighbour (NN) propensity score (PS) matching w/o replacement
+m.out1 <- matchit(GROUP3 ~ T2_ART_DUR_DAYS, data = ecvcpers,
+                 method = "nearest", distance = "glm", ratio = 2)
+summary(m.out1)
+
+plot(m.out1, type = "jitter", interactive = FALSE)
+plot(m.out1, type = "density", interactive = FALSE,
+     which.xs = ~T2_ART_DUR_DAYS)
+
+# matched dataset:
+ecvcpers_matched <- match.data(m.out1)
+summary(ecvcpers_matched$subclass)
+
+### ECVCtrans
+# 1:n Nearest neighbour (NN) propensity score (PS) matching w/o replacement
+m.out1 <- matchit(GROUP3 ~ T2_ART_DUR_DAYS, data = ecvctrans,
+                 method = "nearest", distance = "glm", ratio = 2)
+summary(m.out1)
+
+plot(m.out1, type = "jitter", interactive = FALSE)
+plot(m.out1, type = "density", interactive = FALSE,
+     which.xs = ~T2_ART_DUR_DAYS)
+
+# matched dataset:
+ecvctrans_matched <- match.data(m.out1)
+summary(ecvcpers_matched$subclass)
+
+keep_ids <- unique(c(ecvcpers_matched$ID, ecvctrans_matched$ID))
+matched_df <- merge_df[which(merge_df$ID %in% keep_ids),]
+summary(matched_df$GROUP3)
+
+# ages table
+summary_table <- matched_df %>%
+  group_by(GROUP3) %>%
+  summarise(val = paste0(round(median(T2_ART_DUR_DAYS/365.25, na.rm = TRUE),1), " (", round(IQR(T2_ART_DUR_DAYS/365.25, na.rm = TRUE),1), ")")) %>%
+  pivot_wider(names_from = GROUP3, values_from = val) %>%
+  mutate(stat = "median ART duration in years (IQR)") %>%
+  select(stat, everything())
+
+# Display summary_table
+print(summary_table)
+
+```
+##### Run final model
+```{r}
+merge_df <- matched_df
+
+example <- data.frame(NA,NA,NA,NA,NA,NA,NA,NA)
+colnames(example) <- c("Outcome","Covariate","Value","Std.Error","DF","t-value","p-value","fdr")
+summarystatistics <- list(example,example,example)
+names(summarystatistics) <-  c("EC_ART","VCpersistent_ART","VCtransient_ART")
+
+lmm_on_subset <- function(analysisname, treatment, reference, covar_text) {
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == treatment|
+                                      merge_df$GROUP3 == reference),])
+olinkcolumns <- c((grep("GROUP3",colnames(merge_df))+1): grep("NFU1",colnames(merge_df)))
+
+# run the mixed linear model regression
+mod2 <- NULL 
+system.time( 
+for (i in olinkcolumns) {
+  regression_formula <- as.formula(paste(names(mergedf1)[i],"~ GROUP3 +",covar_text)) # make a formula with the olink column name
+  lmod <- nlme::lme(regression_formula,
+                    random = ~ 1|ID, # the IDs are set as random effect here
+                    data = mergedf1,
+                    na.action=na.omit,
+                    control =list(msMaxIter = 1000, msMaxEval = 1000))
+  
+  # extract statistics
+  stab <- t(summary(lmod)$tTable[2,]) %>% as.data.frame()
+  stab$Covariate <-  analysisname
+  stab$Outcome <- colnames(merge_df)[i]
+  stab %>%
+    dplyr::select(Outcome, Covariate, everything()) ->
+    stab
+  mod2 <- rbind(mod2, stab)
+})
+mod2$fdr <- p.adjust(mod2$`p-value`, method = 'BH')
+mod2 <- mod2[order(mod2$`p-value`),] # order by P value
+
+return (mod2)
+}
+
+summarystatistics[["EC_ART"]] <- lmm_on_subset("EC_ART", "EC_onART", "EC_preART", "AGE + STORAGE_TIME")
+summarystatistics[["VCpersistent_ART"]] <- lmm_on_subset("VCpersistent_ART", "VCpersistent_onART", "VCpersistent_preART", "AGE + SEX + STORAGE_TIME + CENTER")
+summarystatistics[["VCtransient_ART"]] <- lmm_on_subset("VCtransient_ART", "VCtransient_onART", "VCtransient_preART", "AGE + SEX + STORAGE_TIME + CENTER")
+
+summarystatistics
+
+# change list names so it includes sample size: 
+names(summarystatistics) <- paste0(names(summarystatistics),"_",c("9","18","18"))
+# c("EC_TIME_19","EC_ART_9","VCpersistent_TIME_23","VCpersistent_ART_57","VCtransient_ART_36")
+
+openxlsx::write.xlsx(summarystatistics,paste0(working_dir,"Outputs/RebuttalAddition_ARTDURMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"))
+
+```
+
+#### RebuttalFigure - volcano VCpersistent
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/RebuttalAddition_ARTDURMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCpersistent_ART_18")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.01', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.001 | # 'FDR-P <0.01'
+     (diff_df$RAW_P[i] < 0.01 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("18 persistent VC paired samples ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 3, aes(label = LABEL,hjust = .5))+
+  #xlim(-5,3) + ylim(0,1.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+ggsave(paste0(working_dir, "Outputs/RebuttalAdditionARTDUR_ECVCART_Volcano_label_0.01FDRP_2FC_57VCpersistent_ART_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL, width = 4, height =4, units = 'in', dpi = 300)
+
+# Check direction:
+mergedf1 <- droplevels(merge_df[which(merge_df$GROUP3 == "VCpersistent_onART"|
+                                      merge_df$GROUP3 == "VCpersistent_preART"),])
+boxplot(mergedf1$CD6~as.factor(mergedf1$GROUP3))
+boxplot(mergedf1$LY9~as.factor(mergedf1$GROUP3)) 
+```
+
+#### RebuttalFigure  - volcano VCtransient
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/RebuttalAddition_ARTDURMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "VCtransient_ART_18")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.001 | # 'FDR-P <0.05'
+     (diff_df$RAW_P[i] < 0.01 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("#b2182b","orange","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("18 transient VC paired samples ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  #xlim(-4.1,3) + ylim(0, 6) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) #+ # Add a vertical line for Estimate change cut-offs
+  #geom_hline(yintercept= log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/RebuttalAdditionARTDUR_ECVCART_Volcano_label_0.001FDRP_2FC_36VCtransient_ART_2420_age_storage.pdf"), plot = g, width = 4, height =4, units = 'in', dpi = 300)
+```
+
+#### RebuttalFigure - volcano ECpersistent
+```{r}
+# read the summary statistics for VC persistent
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/RebuttalAddition_ARTDURMATCHED_LMM_Olink_ECVC_ARTandTIME_2420_age_storage_sex_center.xlsx"), sheet = "EC_ART_9")
+
+diff_df <- result2[,c("Outcome","p-value","fdr","Value")]
+colnames(diff_df) <- c("PROTEIN","RAW_P", "FDR_P","LOG_FC")
+
+# add a grouping column for coloring by significance; default value is "not significant"
+diff_df <- diff_df %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'FDR-P <0.05 but LOG_FC >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(diff_df)){
+  if(diff_df$RAW_P[i] < 0.01 | # 'FDR-P <0.05'
+     (diff_df$FDR_P[i] < 0.05 & abs(diff_df$LOG_FC[i]) > 2 | # 'FDR-P <0.05 but LOG_FC >2'
+     (diff_df$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     )))
+  {diff_df$LABEL[i] <- diff_df$PROTEIN[i]} else
+  {diff_df$LABEL[i] <- ""}}
+diff_df
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+g <- ggplot(diff_df, aes(x=LOG_FC, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("orange","#4d4d4d")) + # no red because no FDR significant
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, vjust=1),
+        axis.text.y=element_text(angle=0, size=8, vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Log2 Fold Change NPX") +
+  ylab("-Log10 P value") +
+  ggtitle("9 persistent EC paired samples ART" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2.75, aes(label = LABEL,hjust = .5))+
+  xlim(-4.1,3.4) + ylim(0, 4.5) + # limits of the graph
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", size=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept= -log10(0.05), linetype="longdash", colour="black", size=0.4) #Add a horizontal line for P-value cut-off
+g
+
+ggsave(paste0(working_dir, "Outputs/RebuttalAdditionARTDUR_ECVCART_Volcano_label_0.001RAWP_2FC_9EC_ART_2420_age_storage.pdf"), plot = g, device = NULL, path = NULL,scale = 1, width = 4, height =4, units = 'in', dpi = 300)
+```
+
+
+
+
+
+
