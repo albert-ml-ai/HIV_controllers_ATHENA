@@ -1,0 +1,1649 @@
+---
+title: "Olink analysis eliteATHENA and 2000HIV"
+author: "Albert Groenendijk & Nadira Vadaq"
+date: "2022-11-22"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+---
+
+Updated July and December 2023 and January 2024 by Nadira.
+Major revisions, refactor and expansions by Albert, starting 9 February 2024, further additions October and December 2024.
+
+```{r echo=T, results='hide', warning=F,message=F}
+working_dir <- c("HIV_controllers_ATHENA/AthenaOlink_Cleaning/")
+
+library(FactoMineR)
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(table1)
+library(ggbiplot)
+library(ggplot2)
+library(openxlsx)
+library(limma)
+library(tidyverse)
+library(ggrepel)
+```
+
+
+## Read data elite ATHENA comparison 1
+
+```{r, warning=FALSE}
+##### Read Olink comparison 1 file #####
+# Check missingness of clinical information:
+master_df <-  openxlsx::read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_EC_vs_VC_183samp_2420Prots_masterdata.xlsx"))
+colSums(is.na(master_df[,c(1:21)]))
+# In summary, no. of missing in the following columns: 31 BMI, 23 ETHNICITY, 14 SMOKING_CURRENT and 2 CD4
+
+# Read and clean the file
+master_df <-  master_df %>%
+  mutate_at(c(2,10,11,14,16,17,21), as.factor)%>%
+  mutate(NONVIREMIC =  factor(NONVIREMIC, levels = c(1,0),labels = c("EC","VC")))
+
+summary(master_df$NONVIREMIC)
+# ART-naïve VC           EC 
+#          147           36  
+ 
+##### Summary statistics comparison 1 file #####
+# from library table1
+df_m <- master_df #%>% 
+
+# run table1 function for summary statistics of overall cohort
+  table1(~ AGE + 
+           SEX +
+           T1_BMI +
+           CENTER +
+           SMOKING_CURRENT +
+           ETHNICITY +
+           CD4 +
+           CD4NADIR +
+           VL +
+           HIV_DUR +
+           Storage_time| NONVIREMIC, data=df_m)
+  
+#Statistics
+df_lib <- df_m
+names(df_lib)[1:30]
+
+#wilcoxon/ttest 
+modelList<-list()
+for(i in c(12,13,15,5,18:20)){
+  fmla <- formula(paste(names(df_lib)[i], " ~ NONVIREMIC"))
+  modelList[[i]]<-wilcox.test(fmla, data = df_lib, paired = FALSE)
+}
+modelList
+rm(modelList)
+
+#chisquare
+df_lib[,c(2,14,17,21,10)] %>% 
+  dplyr::summarise_each(funs(chisq.test(., 
+                                 df_lib$NONVIREMIC)$p.value), -one_of("NONVIREMIC"))
+
+rm(df_m, df_lib)
+```
+
+### ADDENDUM 2/12/2024 UPDATE TABLE 1
+
+```{r}
+# Custom rendering function
+rndr <- function(x, name, ...) {
+  if (is.numeric(x)) {
+    med_iqr <- function(x) {
+      iqr <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+      sprintf("%.1f [%.1f, %.1f]", median(x, na.rm = TRUE), iqr[1], iqr[2])
+    }
+    return(med_iqr(x))
+  } else {
+    return(render.categorical.default(x))
+  }
+}
+
+# Use the custom rendering function in table1()
+df_m <- master_df #%>% 
+
+# run table1 function for summary statistics of overall cohort
+  table1(~ AGE + 
+           SEX +
+           T1_BMI +
+           CENTER +
+           SMOKING_CURRENT +
+           ETHNICITY +
+           CD4 +
+           CD4NADIR +
+           VL +
+           HIV_DUR +
+           Storage_time| NONVIREMIC, data=df_m, render = rndr)
+
+```
+
+
+
+### Transform T1_DATE and verify seasonality and storagetime
+```{r}
+# transform date
+master_df$T1_DATE <- as.Date(master_df$T1_DATE, origin = "1899-12-30")
+
+
+str(master_df[,c("CENTER","T1_DATE","Days_since_Jan2001","Storage_time","SEASON_SIN","SEASON_COS",
+             "NONVIREMIC","GROUP","HIV_DUR","AGE","SEX",
+             "T1_BMI","SMOKING_EVER","SMOKING_CURRENT","VL","CD4","CD4NADIR","ETHNICITY")])
+
+# verify seasonality
+master_df <- master_df %>% mutate(Days_since_Jan2001_2 = as.numeric(difftime(T1_DATE, as.Date("2001-01-01"), units="days")),
+                    SEASON_SIN_2 = sin((2*pi*Days_since_Jan2001_2)/365.2425),
+                    SEASON_COS_2 = cos((2*pi*Days_since_Jan2001_2)/365.2425))
+head(master_df[,c("T1_DATE","Days_since_Jan2001", "SEASON_SIN", "SEASON_COS", "Days_since_Jan2001_2", "SEASON_SIN_2", "SEASON_COS_2")])
+# seasonality is correct, remove the double columns
+master_df <- master_df %>% select(-c(Days_since_Jan2001_2, SEASON_SIN_2, SEASON_COS_2))
+
+# storage time
+temp <- head(master_df[,c("T1_DATE","Storage_time")])
+temp$ORIGIN <- temp$T1_DATE + temp$Storage_time
+unique(temp$ORIGIN)
+rm(temp)
+# origin date used to calculate storage time is "2022-01-01"
+# change colname to uppercase
+colnames(master_df)[which(colnames(master_df) == "Storage_time")] <- "STORAGE_TIME"
+```
+
+### Create categorical season and BMI
+```{r}
+# add SEASON_CAT
+# define a function to get season
+getSeason <- function(input.date){
+  numeric.date <- 100*month(input.date)+day(input.date)
+  ## input Seasons upper limits in the form MMDD in the "break =" option:
+  cuts <- base::cut(numeric.date, breaks = c(0,319,0620,0921,1220,1231)) 
+  # rename the resulting groups (could've been done within cut(...levels=) if "Winter" wasn't double
+  levels(cuts) <- c("Winter","Spring","Summer","Fall","Winter")
+  return(cuts)
+}
+master_df$SEASON_CAT <-  getSeason(master_df$T1_DATE)
+
+# add BMI_CAT
+master_df <- master_df %>% mutate(BMI_CAT = case_when(T1_BMI <21 ~ '<21',
+                                        T1_BMI >= 21  & T1_BMI <= 25 ~ '21-25',
+                                        T1_BMI >= 25 ~ '>25'))
+master_df$BMI_CAT <- as.factor(master_df$BMI_CAT)
+```
+
+### Create ETHNICITY_BLACK and ETHNICITY_WHITE
+```{r}
+master_df <- master_df %>% mutate(ETHNICITY_WHITE = case_when(ETHNICITY == "White" ~ 1,
+                                                             ETHNICITY != "White" & !is.na(ETHNICITY) ~ 0),
+                                 ETHNICITY_BLACK = case_when(ETHNICITY == "Black" ~ 1,
+                                                             ETHNICITY != "Black" & !is.na(ETHNICITY) ~ 0))
+master_df <- master_df %>% mutate_at(c("ETHNICITY_WHITE","ETHNICITY_BLACK"), as.factor)
+```
+
+### Create CENTER dummy variables
+```{r}
+levels(master_df$CENTER)
+master_df <- master_df %>% mutate(CENTER_EMC = case_when(CENTER == "EMC" ~ 1,
+                                                         CENTER != "EMC" ~ 0),
+                                  CENTER_LUMC = case_when(CENTER == "LUMC" ~ 1,
+                                                         CENTER != "LUMC" ~ 0),
+                                  CENTER_MSZ = case_when(CENTER == "MSZ" ~ 1,
+                                                         CENTER != "MSZ" ~ 0),
+                                  CENTER_OLVG = case_when(CENTER == "OLVG" ~ 1,
+                                                         CENTER != "OLVG" ~ 0),
+                                  CENTER_RAD = case_when(CENTER == "RAD" ~ 1,
+                                                         CENTER != "RAD" ~ 0),
+                                  CENTER_UMCU = case_when(CENTER == "UMCU" ~ 1,
+                                                         CENTER != "UMCU" ~ 0))
+master_df <- master_df %>% mutate_at(c("CENTER_EMC","CENTER_LUMC","CENTER_MSZ",
+                                       "CENTER_OLVG","CENTER_RAD","CENTER_UMCU"), as.factor)
+```
+
+### add a log-transformed baseline VL
+```{r}
+# add LOGVL
+master_df$LOG10VL <- master_df$VL
+master_df$LOG10VL[which(master_df$LOG10VL == 0)] <- 50 # replace 0 which is <50 with 50, because log10(0) is Inf
+master_df$LOG10VL <- log10(master_df$LOG10VL)
+
+```
+
+### add sqrt-transformed CD4
+```{r}
+# add CD4
+master_df$SQRTCD4 <- sqrt(master_df$CD4)
+master_df$SQRTCD4NADIR <- sqrt(master_df$CD4NADIR)
+```
+
+
+
+## Add virological loss data to identify VCpersistent from VCtransient
+
+For the prediction of virological loss, defined as reaching >10,000 copies/mL, we only look at VC. This is because only N=1 EC (out of 36 EC) reaches the definition of virological loss. There are however, in total 9 EC who lose elite control and becomes VC.
+```{r}
+# prediction model is only with VC
+vc <- master_df[which(master_df$NONVIREMIC == "VC"),]
+
+# read loss data
+dfloss <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_ECVC_Loss_vs_NoLoss_181samp_2420Prots_masterdata.xlsx"))
+table(as.factor(dfloss$LOSS), as.factor(dfloss$NONVIREMIC))
+colnames(dfloss)[1] <- "COMP_1_2_ID"
+# only keep loss column
+dfloss <- dfloss[,c("COMP_1_2_ID","ID","LOSS")]
+# join with vc dataframe
+vc <- left_join(vc, dfloss, by= "COMP_1_2_ID")
+
+# create LOSS factor
+vc$LOSS <- factor(vc$LOSS, c("Lost_EC_status","Kept_EC_status"),c("Transient_VC", "Persistent_VC"))
+summary(vc$LOSS)
+
+# it is correct that there are two loss = NA, because these individuals had a VL of 10,000 right before starting ART. Probably loss but did not reach definition.
+vc <- vc[-which(is.na(vc$LOSS)),]
+rm(dfloss)
+
+# Join the loss column for the PCAs in the next script
+master_df <- left_join(master_df, vc[,c("COMP_1_2_ID","LOSS")], by = "COMP_1_2_ID")
+
+# export the object
+saveRDS(master_df, paste0(working_dir, "Outputs/AthenaOlink_EC_vs_VC_Cleaned.rds"))
+```
+
+
+## Visualize distribution between EC and VC and between VCpersistent and VCtransient
+List of covariates:
+* AGE
+* SEX
+* T1_BMI
+* BMI_CAT
+* ETHNICITY
+* CENTER
+* SMOKING_EVER
+* SMOKING_CURRENT
+* T1_DATE
+* SEASONALITY
+* STORAGE_TIME
+* HIV_DUR
+* VL
+* LOG10VL
+* CD4
+* CD4NADIR
+
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+
+S <- master_df
+H <- vc
+
+ggsave(paste0(working_dir, "Outputs/Supplements_Demographics_between_groups1.pdf"),
+       suppressWarnings(gridExtra::grid.arrange(
+# AGE
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=AGE)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1),
+                         plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    xlab("") +
+      ggtitle("AGE",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$AGE~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=AGE)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1),
+                         plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    xlab("") +
+      ggtitle("AGE",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$AGE~H$LOSS)$p.value,3))), ncol = 2),   
+
+# SEX
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(SEX)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SEX_BIRTH",subtitle = paste("Chi squared P =",signif(chisq.test(S$SEX,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(SEX)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SEX_BIRTH",subtitle = paste("Chi squared P =",signif(chisq.test(H$SEX,H$LOSS)$p.value,3))) , ncol = 2),
+
+# BMI
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=T1_BMI)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("T1_BMI",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$T1_BMI~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=T1_BMI)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("T1_BMI",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$T1_BMI~H$LOSS)$p.value,3))), ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(BMI_CAT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("BMI_CAT",subtitle = paste("Chi squared P =",signif(chisq.test(S$BMI_CAT,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(BMI_CAT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("BMI_CAT",subtitle = paste("Chi squared P =",signif(chisq.test(H$BMI_CAT,H$LOSS)$p.value,3))) , ncol = 2),
+
+# ETHNICITY
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(ETHNICITY)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("ETHNICITY",subtitle = paste("Chi squared P =",signif(chisq.test(S$ETHNICITY,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(ETHNICITY)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("ETHNICITY",subtitle = paste("Chi squared P =",signif(chisq.test(H$ETHNICITY,H$LOSS)$p.value,3))) , ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(ETHNICITY_BLACK)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("ETHNICITY_BLACK",subtitle = paste("Chi squared P =",signif(chisq.test(S$ETHNICITY_BLACK,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(ETHNICITY_BLACK)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("ETHNICITY_BLACK",subtitle = paste("Chi squared P =",signif(chisq.test(H$ETHNICITY_BLACK,H$LOSS)$p.value,3))) , ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(ETHNICITY_WHITE)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("ETHNICITY_WHITE",subtitle = paste("Chi squared P =",signif(chisq.test(S$ETHNICITY_WHITE,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(ETHNICITY_WHITE)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("ETHNICITY_WHITE",subtitle = paste("Chi squared P =",signif(chisq.test(H$ETHNICITY_WHITE,H$LOSS)$p.value,3))) , ncol = 2),
+
+# center
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(CENTER)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("CENTER",subtitle = paste("Chi squared P =",signif(chisq.test(S$CENTER,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(CENTER)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("CENTER",subtitle = paste("Chi squared P =",signif(chisq.test(H$CENTER,H$LOSS)$p.value,3))) , ncol = 2),
+
+ncol = 2,nrow = 4)),
+width = 210, height = 297, units = "mm") # A4 size )))
+
+
+###
+ggsave(paste0(working_dir, "Outputs/Supplements_Demographics_between_groups2.pdf"),
+       suppressWarnings(gridExtra::grid.arrange(
+# SMOKING
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(SMOKING_CURRENT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SMOKING_CURRENT",subtitle = paste("Chi squared P =",signif(chisq.test(S$SMOKING_CURRENT,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(SMOKING_CURRENT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SMOKING_CURRENT",subtitle = paste("Chi squared P =",signif(chisq.test(H$SMOKING_CURRENT,H$LOSS)$p.value,3))) , ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(SMOKING_EVER)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SMOKING_EVER",subtitle = paste("Chi squared P =",signif(chisq.test(S$SMOKING_EVER,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(SMOKING_EVER)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SMOKING_EVER",subtitle = paste("Chi squared P =",signif(chisq.test(H$SMOKING_EVER,H$LOSS)$p.value,3))) , ncol = 2),
+
+# STORAGE_TIME
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=STORAGE_TIME)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("STORAGE_TIME",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$STORAGE_TIME~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=STORAGE_TIME)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("STORAGE_TIME",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$STORAGE_TIME~H$LOSS)$p.value,3))), ncol = 2),
+
+# T1_DATE
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=T1_DATE)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("T1_DATE",subtitle = paste("MannWhitney P =",signif(wilcox.test(as.numeric(S$T1_DATE)~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=T1_DATE)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("T1_DATE",subtitle = paste("MannWhitney P =",signif(wilcox.test(as.numeric(H$T1_DATE)~H$LOSS)$p.value,3))), ncol = 2),
+
+# HIV_DUR
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=HIV_DUR)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("HIV_DUR",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$HIV_DUR~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=HIV_DUR)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("HIV_DUR",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$HIV_DUR~H$LOSS)$p.value,3))), ncol = 2),
+
+# SEASON
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=SEASON_SIN)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("SEASON_SIN",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$SEASON_SIN~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=SEASON_SIN)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("SEASON_SIN",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$SEASON_SIN~H$LOSS)$p.value,3))), ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=SEASON_COS)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("SEASON_COS",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$SEASON_COS~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=SEASON_COS)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("SEASON_COS",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$SEASON_COS~H$LOSS)$p.value,3))), ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S, aes(NONVIREMIC))+
+    geom_bar(aes(fill=as.factor(SEASON_CAT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SEASON_CAT",subtitle = paste("Chi squared P =",signif(chisq.test(S$SEASON_CAT,S$NONVIREMIC)$p.value,3))),
+  ggplot(H, aes(LOSS))+
+    geom_bar(aes(fill=as.factor(SEASON_CAT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6),legend.text = element_text(size = 6))+ 
+    ggtitle("SEASON_CAT",subtitle = paste("Chi squared P =",signif(chisq.test(H$SEASON_CAT,H$LOSS)$p.value,3))) , ncol = 2),
+
+
+ncol = 2,nrow = 4)),
+width = 210, height = 297, units = "mm") # A4 size )))
+
+###
+ggsave(paste0(working_dir, "Outputs/Supplements_Demographics_between_groups3.pdf"),
+       suppressWarnings(gridExtra::grid.arrange(
+# VL
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=VL)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("VL",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$VL~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=VL)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("VL",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$VL~H$LOSS)$p.value,3))), ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=LOG10VL)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("LOG10VL",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$LOG10VL~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=LOG10VL)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("LOG10VL",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$LOG10VL~H$LOSS)$p.value,3))), ncol = 2),
+
+# CD4
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=CD4)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("CD4",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$CD4~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=CD4)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("CD4",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$CD4~H$LOSS)$p.value,3))), ncol = 2),
+
+gridExtra::grid.arrange(
+  ggplot(S,aes(x=NONVIREMIC, y=CD4NADIR)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("CD4NADIR",subtitle = paste("MannWhitney P =",signif(wilcox.test(S$CD4NADIR~S$NONVIREMIC)$p.value,3))),
+  ggplot(H,aes(x=LOSS, y=CD4NADIR)) + 
+      geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+      geom_boxplot(width = .5,outlier.shape = NA) +
+      theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust=1),plot.subtitle = element_text(colour = "black",face = "italic", size = 8),plot.title = element_text(face = "bold", size = 10),axis.text.y = element_text(colour="black",size = 6)) + xlab("") +
+      ggtitle("CD4NADIR",subtitle = paste("MannWhitney P =",signif(wilcox.test(H$CD4NADIR~H$LOSS)$p.value,3))), ncol = 2),
+
+
+ncol = 2,nrow = 4)),
+width = 210, height = 297, units = "mm") # A4 size )))
+
+
+rm(S,H)
+```
+## Interpretation covariates
+
+Between EC and VC:
+* AGE is slightly higher in EC
+* T1_BMI is slightly higher in EC
+* CENTER is more often MSZ and RAD in EC, but less often EMC and no LUMC
+* STORAGE_TIME is shorter in EC (and T1_DATE more recent)
+* [VL and LOG10VL are by definition lower in EC]
+* [CD4 and CD4NADIR are higher in EC]
+
+Between Transient_VC and Persistent_VC:
+* CENTER trends to more often OLVG in Transient_VC
+* ETHNICITY_WHITE trends to more in Transient_VC
+* VL and LOG10VL are slightly higher in Transient_VC
+
+Importantly, the other covariates are equally distributed and correction for those is strictly not needed, although a sensitivity analysis is usually good to confirm.
+
+Now, the question is whether these demographics significantly influence protein expression, which will be determines by correlating covariates with principle components, in the DifferentialExpression script.
+
+
+
+# Clean data 2000HIV (Validation cohort)
+
+Read data 2000HIV and prepare data for comparison.
+
+From the dataset we read, there are only "EC_persistent_viremic_noART" and "EC_persistent_nonviremic_noART" of patients that are not already in our ATHENA dataset.
+
+
+```{r}
+##### Read Olink comparison 1 file #####
+master_df <-  openxlsx::read.xlsx(paste0(working_dir,"Inputs/Olink_2000HIV_EC_vs_VC_1910samp_2409_Prots_masterdata.xlsx")) 
+
+table(master_df$EC_combined)
+  # EC_persistent_nonviremic_noART
+  #                             14
+  #  EC_persistent_viremic_noART
+  #                            5 
+```
+```{r}
+library(table1) 
+
+df_m <- master_df %>% 
+  mutate(EC_combined = ifelse(EC_combined == "EC_persistent_viremic_noART","ARTnaive_VC","EC"))%>%
+  mutate_at(c("EC_combined","CENTER","SEX_BIRTH","SMOKING_CURRENT", "ETHNICITY", "PANDEMIC_BEFOREAFTER","COVID19","COVID_VACC"),funs(factor)) %>%
+  mutate(VL_numeric = ifelse(is.na(VL_LATEST_OTHER), VL_LATEST,VL_LATEST_OTHER),.after=VL_LATEST_OTHER) %>%
+  mutate(CD4_NADIR = CD4_NADIR * 1000, CD4_LATEST = CD4_LATEST * 1000) 
+
+summary(as.factor(df_m$EC_combined))
+
+saveRDS(df_m %>% select(-ID), paste0(working_dir, "Outputs/Validation2000HIVOlink_EC_vs_VC_Cleaned.rds"))
+######
+```
+
+```{r}
+
+# run table1 function for summary statistics of overall cohort
+table1(~ AGE + 
+         CENTER +
+         SEX_BIRTH +
+         BMI_BASELINE +
+         SMOKING_CURRENT +
+         ETHNICITY +
+         CD4_LATEST +
+         CD4_NADIR +
+         VL_numeric +
+         HIV_DURATION +
+         PANDEMIC_BEFOREAFTER + COVID19 + COVID_VACC | EC_combined  , data=df_m)
+
+#Statistics
+df_lib <- df_m
+names(df_lib)[1:150]
+
+#wilcoxon/ttest 
+modelList<-list()
+for(i in c(11,79,84:85,142,144)){
+  fmla <- formula(paste(names(df_lib)[i], " ~ EC_combined"))
+  modelList[[i]]<-wilcox.test(fmla, data = df_lib, paired = FALSE)
+}
+modelList
+
+#chisquare
+# df_lib[,c(6,7,9,17,16,66,71,62)] %>% 
+#   dplyr::summarise_each(funs(chisq.test(., 
+#                                  df_lib$EC_combined)$p.value), -one_of("EC_combined"))
+
+```
+
+### ADDENDUM 2/12/2024 UPDATE TABLE 1
+
+```{r}
+# Custom rendering function
+rndr <- function(x, name, ...) {
+  if (is.numeric(x)) {
+    med_iqr <- function(x) {
+      iqr <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+      sprintf("%.1f [%.1f, %.1f]", median(x, na.rm = TRUE), iqr[1], iqr[2])
+    }
+    return(med_iqr(x))
+  } else {
+    return(render.categorical.default(x))
+  }
+}
+
+# run table1 function for summary statistics of overall cohort
+table1(~ AGE + 
+         CENTER +
+         SEX_BIRTH +
+         BMI_BASELINE +
+         SMOKING_CURRENT +
+         ETHNICITY +
+         CD4_LATEST +
+         CD4_NADIR +
+         VL_numeric +
+         HIV_DURATION +
+         PANDEMIC_BEFOREAFTER + COVID19 + COVID_VACC | EC_combined, data=df_m, render = rndr)
+
+```
+
+# Cleaning Paired Samples Data: Effect of Time & ART
+
+```{r}
+master_df <-  openxlsx::read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_ECVC_preART_vs_postART_206samp_2420Prots_masterdata.xlsx"))%>%
+  mutate_at(c(2,3,5,11,16,17,22,23,32:36), as.factor)%>%
+  #filter(!NONVIREMIC==1)%>%
+  mutate(STATUS=  ifelse(STATUS == "T1","preART","postART"))
+ 
+table(master_df$STATUS)
+# postART  preART 
+#      103      103 
+```
+## Patient characteristics before and after ART (paired samples)
+```{r}
+
+##### Summary statistics #####
+library(table1) 
+library(tidyr)
+
+df_m <- master_df %>% 
+  drop_na(LOSS) %>%
+  #filter(!NONVIREMIC==1) %>%
+  dplyr::mutate(
+    NONVIREMIC = ifelse(NONVIREMIC==1,"EC","VC"),
+    LOSS = ifelse(LOSS==1,"Transient","Persistent"),
+    nonviremic_loss = paste0(NONVIREMIC,"_",LOSS),.after=T2_PI)%>%
+  mutate_at(c("STATUS","CENTER","SEX","SMOKING_CURRENT_T1","SMOKING_EVER_T1", 
+              "NONVIREMIC","ETHNICITY","T2_REGIMEN","T2_TENOFOVIR", "LOSS",
+              "T2_TENOFOVIR_SPEC","T2_INSTI","T2_NNRTI","T2_PI","nonviremic_loss"),funs(factor))
+df_m$STATUS <- factor(df_m$STATUS, levels = c("preART","postART"))
+
+# run table1 function for summary statistics of overall cohort
+  table1(~ AGE + 
+           SEX +
+           BMI +
+           CENTER +
+           SMOKING_CURRENT_T1 +
+           #SMOKING_EVER_T1 +
+           ETHNICITY +
+           CD4_LATEST +
+           T1_CD4NADIR +
+           VL +
+           VL_ZENITH +
+           HIV_DUR_T1 +
+           T2_VL_UNDETECT +
+           #T2_INTERRUPTED_ART +
+           T2_ART_DUR_DAYS +
+           #T2_REGIMEN +
+           #T2_TENOFOVIR +
+           #T2_TENOFOVIR_SPEC +
+           T2_INSTI + T2_NNRTI + T2_PI +
+           Storage_time  +
+           FU_TOTAL
+           | nonviremic_loss + STATUS, data=df_m)
+  
+#Statistics
+table(df_m$nonviremic_loss)
+df_lib <- df_m %>% 
+  dplyr::filter(nonviremic_loss=="VC_Transient") #%>% #EC_Persistent
+  #filter(!COMP_1_ID %in% c("EL-19270_T1","EL-19270_T2","EL-21185_T1","EL-21185_T2"))
+names(df_lib)[1:40]
+summary(as.factor(df_lib$STATUS))
+
+#wilcoxon/ttest 
+modelList<-list()
+for(i in c(8,13,19,20)){
+  fmla <- formula(paste(names(df_lib)[i], " ~ STATUS"))
+  modelList[[i]]<-wilcox.test(fmla, data = df_lib, paired = TRUE, exact = FALSE)
+}
+
+#chisquare
+df_lib[,c(3,17)] %>% 
+  dplyr::summarise_each(funs(chisq.test(., 
+                                 df_lib$STATUS)$p.value), -one_of("STATUS"))
+```
+```{r}
+# Custom rendering function
+rndr <- function(x, name, ...) {
+  if (is.numeric(x)) {
+    med_iqr <- function(x) {
+      iqr <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+      sprintf("%.1f [%.1f, %.1f]", median(x, na.rm = TRUE), iqr[1], iqr[2])
+    }
+    return(med_iqr(x))
+  } else {
+    return(render.categorical.default(x))
+  }
+}
+
+# Use the custom rendering function in table1()
+
+# run table1 function for summary statistics of overall cohort
+table1(~ AGE + 
+         SEX +
+         BMI +
+         CENTER +
+         SMOKING_CURRENT_T1 +
+         #SMOKING_EVER_T1 +
+         ETHNICITY +
+         CD4_LATEST +
+         T1_CD4NADIR +
+         VL +
+         VL_ZENITH +
+         HIV_DUR_T1 +
+         T2_VL_UNDETECT +
+         #T2_INTERRUPTED_ART +
+         T2_ART_DUR_DAYS +
+         #T2_REGIMEN +
+         #T2_TENOFOVIR +
+         #T2_TENOFOVIR_SPEC +
+         T2_INSTI + T2_NNRTI + T2_PI +
+         Storage_time  +
+         FU_TOTAL
+         | nonviremic_loss + STATUS, data=df_m, render = rndr)
+```
+
+To evaluate the impact of Time we also compare the paired samples of EC/VC who do not start ART, and have two different ART-naive samples. We therefore need to expand the previous datasets with only N=103 individuals who start ART.
+
+```{r}
+# load full olink data, from which outliers have been removed: 6 based on PCA olink data, and 4 on clinical grounds (N=1 shortly after giving birth, N=1 high viremia, N=2 <6 months ART)
+olink <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_AllSamples_duplicates_outliers_removed.xlsx"),check.names = F)
+colnames(olink)[1] <- "SampleID"
+colnames(olink) <- sub("-","_",colnames(olink))
+
+# remove olink proteins with too much missing data
+temp <- read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_ECVC_preART_vs_postART_206samp_2420Prots_masterdata.xlsx"))
+
+colnames(temp)[grep("HLA",colnames(temp))] <- c("HLA_E","HLA_DRA","HLA_A") # these colnames have a '.' instead of '_'
+colnames(temp)[grep("ERV",colnames(temp))] <- c("ERVV_1") # these colnames have a '.' instead of '_'
+
+olinkcolumns <- colnames(temp)[grep("GP2",colnames(temp)):ncol(temp)] # these are proteins to be kept
+olink <- cbind(olink[,"SampleID"], # keep the SampleID column
+               olink[,which(colnames(olink) %in% olinkcolumns)]) # subset the data
+colnames(olink)[1] <- "SampleID"
+
+clin <- read.csv2(paste0(working_dir, "Inputs/Olink_SHM_AllPatients_clinical_database_v2_12_outliers_removed.csv"))
+```
+
+#### Export Cleaned Olink data
+```{r}
+saveRDS(olink, paste0(working_dir, "Outputs/AthenaOlink_AllSamples_Cleaned.rds"))
+```
+
+## Select the samples and turn into longer format
+
+The dataframe is assigned to `S`, which is short for samples.
+```{r}
+# define samples to keep
+S <- clin[which(clin$COMP_1==1 & clin$T2_AVAILABLE==1),] # COMP_1 have T1 and T2 available and without clear reason for exclusion
+# NOTE: There is N=1 individual with LOSS == NA
+
+# Three participants lose control after T2, after 2 and 4 and 7 years, respectively.
+# They can be considered LOSS == 0, since they are still persistent at T2.
+S[which(S$Tx_DATE == "Loss after T2"), c("LOSS")] <- 0
+
+# If T2_DATE is ART-naive, then LOSS should be zero.
+S[which(S$T2_ONART==0 & S$LOSS == 1),c("ID","LOSS","LOSS_DATE","T1_DATE","T2_DATE","ART_START","T1_VL...50.is.undetectable.", "T2_VL")]
+
+# there are no T2 samples in COMP_1_2_ID, and no T1 samples in COMP_3_ID
+length(grep("T2",S$COMP_1_2_ID)) # 0
+length(grep("T1",S$COMP_3_ID)) # 0
+
+# colname T1_VL
+colnames(S)[which(colnames(S)=="T1_VL...50.is.undetectable.")] <- "T1_VL"
+
+# make longer file, by sample
+S <- S[,c("ID","COMP_1_2_ID","COMP_3_ID","CENTER","SEX","AGE_T1","AGE_T2","HEIGHT","WEIGHT_T1","SMOKING_CURRENT_T1","SMOKING_EVER_T1","ART","ART_START","WEIGHT_T2","SMOKING_CURRENT_T2","ETHNICITY","LOSS_ECNONVIR","LOSS","NONVIREMIC","DOB","T1_DATE","T2_DATE", "T1_VL", "T2_VL", "T1_CD4", "T2_CD4")] %>% 
+  pivot_longer(cols = c("COMP_1_2_ID","COMP_3_ID"),names_to = "type", values_to = "SampleID")
+S <- as.data.frame(S[,-which(colnames(S)=="type")])
+rownames(S) <- S$SampleID
+
+# transform date xlsx into R format
+suppressWarnings( for (i in c("DOB","ART_START","T1_DATE","T2_DATE")) {
+  S[,i] <- lubridate::dmy(S[,i])}) # dmy format needs lubridate package
+# 4 fail to parse, these 4 contain the label "no 6 months ART". These four individuals used ART very briefly and then discontinued. They are classified as ART == 0
+
+# there are N = 4 individuals (N=8 rows) with a ART START date after sample T2, this means that they should be considered as ART-naive.
+S[which(S$ART_START > S$T2_DATE),"ART"] <- 0
+S[which(S$ART_START > S$T2_DATE),"ART_START"] <- NA
+
+# make numeric
+for (i in c("HEIGHT","WEIGHT_T1","WEIGHT_T2")){
+  S[,i] <- as.numeric(S[,i])}
+```
+
+Define and clean clinical covariates
+
+```{r}
+# Timepoint T1 or T2
+S$Timepoint <- stringr::str_split_i(S$SampleID,"_",2)
+S <- S %>% mutate(SAMPLEDATE = case_when(Timepoint == "T1" ~ T1_DATE,
+                                         Timepoint == "T2" ~ T2_DATE))
+summary(S$SAMPLEDATE)
+
+# VL and CD4
+S <- S %>% mutate(VL = case_when(Timepoint == "T1" ~ T1_VL,
+                                 Timepoint == "T2" ~ T2_VL),
+                  CD4 = case_when(Timepoint == "T1" ~ T1_CD4,
+                                 Timepoint == "T2" ~ T2_CD4)) %>%
+           mutate_at(c("VL","CD4"), as.numeric)
+
+# LOG10VL
+S$LOG10VL <- S$VL
+S$LOG10VL[which(S$LOG10VL == 0)] <- 50 # replace 0 which is <50 with 50, because log10(0) is Inf
+S$LOG10VL <- log10(S$LOG10VL)
+# SQRTCD4
+S$SQRTCD4 <- sqrt(S$CD4)
+
+# STORAGE_TIME in years 
+S$STORAGE_TIME <- as.numeric((as.Date("2022-01-01") - S$SAMPLEDATE)/365.25) # Nadira used 2022-01-01, 2022-05-01 also correct.
+summary(S$STORAGE_TIME)
+
+# define AGE, some have DOB unknown, but they have the age at sample # DOB is 1st January of year of birth
+S <- S %>% mutate(AGE = case_when(Timepoint == "T1" ~ as.numeric((T1_DATE - DOB)/365.25),
+                                  Timepoint == "T2" ~ as.numeric((T2_DATE - DOB)/365.25)))
+S[which(is.na(S$DOB) & S$Timepoint == "T1"),"AGE"] <- as.numeric(S[which(is.na(S$DOB) & S$Timepoint == "T1"),"AGE_T1"])
+S[which(is.na(S$DOB) & S$Timepoint == "T2"),"AGE"] <- as.numeric(S[which(is.na(S$DOB) & S$Timepoint == "T2"),"AGE_T2"])
+S <- S[,-which(colnames(S) %in% c("AGE_T1","AGE_T2","DOB","T1_DATE","T2_DATE"))]
+summary(S$AGE)
+
+# SEX
+S$SEX <- as.factor(S$SEX)
+colnames(S)[which(colnames(S)=="SEX")] <- "SEX"
+
+# define BMI, which is sometimes unknown
+S <- S %>% mutate(BMI = case_when(Timepoint == "T1" ~ as.numeric(WEIGHT_T1 / (as.numeric(HEIGHT) / 100)^2 ),
+                                  Timepoint == "T2" ~ as.numeric(WEIGHT_T2 / (HEIGHT / 100)^2 )))
+summary(S$BMI)
+S <- S[,-which(colnames(S) %in% c("WEIGHT_T1","WEIGHT_T2","HEIGHT"))]
+
+# add BMI_CAT
+S <- S %>% mutate(BMI_CAT = case_when(BMI <21 ~ '<21',
+                                        BMI >= 21  & BMI <= 25 ~ '21-25',
+                                        BMI >= 25 ~ '>25'))
+S$BMI_CAT <- as.factor(S$BMI_CAT)
+
+# define SMOKING_CURRENT & SMOKING_NEVER
+S <- S %>% mutate(SMOKING_CURRENT = case_when(Timepoint == "T1" ~ SMOKING_CURRENT_T1,
+                                              Timepoint == "T2" ~ SMOKING_CURRENT_T2),
+                  SMOKING_NEVER = case_when(SMOKING_EVER_T1 == "1" | 
+                                            is.na(SMOKING_EVER_T1)  ~ 0,
+                                            SMOKING_EVER_T1 == "0" ~ 1))
+S <- S[,-which(colnames(S) %in% c("SMOKING_CURRENT_T1","SMOKING_CURRENT_T2"))]
+summary(as.factor(S$SMOKING_CURRENT))
+summary(as.factor(S$SMOKING_NEVER))
+
+# Ethnicity
+S$ETHNICITY <- factor(S$ETHNICITY,levels = c("White","Black","Asian","Hispanic","Mixed",""),
+                                     labels = c("White","Black","Asian","Hispanic","Mixed","Unknown"))
+summary(S$ETHNICITY)
+
+# Add "ETHNICITY_WHITE", "ETHNICITY_BLACK"
+S <- S %>% mutate(ETHNICITY_WHITE = case_when(ETHNICITY == "White" ~ 1,
+                                                             ETHNICITY != "White" & !is.na(ETHNICITY) ~ 0),
+                                 ETHNICITY_BLACK = case_when(ETHNICITY == "Black" ~ 1,
+                                                             ETHNICITY != "Black" & !is.na(ETHNICITY) ~ 0))
+S <- S %>% mutate_at(c("ETHNICITY_WHITE","ETHNICITY_BLACK"), as.factor)
+
+# CENTER
+S$CENTER <- as.factor(S$CENTER)
+summary(S$CENTER)
+
+# Add "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ", "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU"
+S <- S %>% mutate(CENTER_EMC = case_when(CENTER == "EMC" ~ 1,
+                                                         CENTER != "EMC" ~ 0),
+                                  CENTER_LUMC = case_when(CENTER == "LUMC" ~ 1,
+                                                         CENTER != "LUMC" ~ 0),
+                                  CENTER_MSZ = case_when(CENTER == "MSZ" ~ 1,
+                                                         CENTER != "MSZ" ~ 0),
+                                  CENTER_OLVG = case_when(CENTER == "OLVG" ~ 1,
+                                                         CENTER != "OLVG" ~ 0),
+                                  CENTER_RAD = case_when(CENTER == "RAD" ~ 1,
+                                                         CENTER != "RAD" ~ 0),
+                                  CENTER_UMCU = case_when(CENTER == "UMCU" ~ 1,
+                                                         CENTER != "UMCU" ~ 0))
+S <- S %>% mutate_at(c("CENTER_EMC","CENTER_LUMC","CENTER_MSZ",
+                                       "CENTER_OLVG","CENTER_RAD","CENTER_UMCU"), as.factor)
+
+# EC vs VCpersistent vs VCtransient, T1 vs T2
+S <- S %>% mutate(ECVC = case_when(NONVIREMIC == 1 & LOSS == 0 ~ "EC", # only the persistent EC, i.e. VL <10,000 c/mL
+                                   NONVIREMIC == 0 & LOSS == 0 ~ "VCpersistent",
+                                   NONVIREMIC == 0 & LOSS == 1 ~ "VCtransient"),
+                  ARTGROUP = case_when(ART == 1 & Timepoint == "T1" ~ "preART",
+                                  ART == 1 & Timepoint == "T2" ~ "onART",
+                                  ART == 0 & Timepoint == "T1" ~ "ARTnaiveT1",
+                                  ART == 0 & Timepoint == "T2" ~ "ARTnaiveT2"))
+S$GROUP3 <- paste(S$ECVC, S$ARTGROUP,sep = "_")
+S$GROUP3 <- factor(S$GROUP3, levels=c("EC_ARTnaiveT1","EC_ARTnaiveT2",
+                                      "EC_preART","EC_onART",
+                                      "VCpersistent_ARTnaiveT1","VCpersistent_ARTnaiveT2",
+                                      "VCpersistent_preART","VCpersistent_onART",
+                                      "VCtransient_preART","VCtransient_onART"))
+# There are 2 NAs, VC that start ART but their LOSS status is unknown.
+
+# Seasonality sin & cos
+## Calculate days since Jan2019
+S$Days_since_Jan2001 <- as.numeric(S$SAMPLEDATE - as.Date("2001-01-01"))
+S$SEASON_SIN <- sin((2*pi*S$Days_since_Jan2001)/365.2425)
+S$SEASON_COS <- cos((2*pi*S$Days_since_Jan2001)/365.2425)
+
+## for PCA, also determine actual season
+S  %<>% 
+  # Extract inclusion month (in numbers)
+  mutate(inclusion_month = as.numeric(stringr::str_split_i(.$SAMPLEDATE, '-', 2))) %>%
+  # If individual is included in December, January or February: winter
+  mutate(SEASON_CAT = as.factor(ifelse(.$inclusion_month %in% c(12, 1, 2), 'Winter',
+                                  # if included in March, April or Mai: Spring
+                                  ifelse(.$inclusion_month %in% c(3, 4, 5), 'Spring',
+                                         # If included in June, July or August: Summer
+                                         ifelse(.$inclusion_month %in% c(6, 7, 8), 'Summer',
+                                                # If included in September, October or November: Autumn
+                                                ifelse(.$inclusion_month %in% c(9, 10, 11), 'Autumn', NA))))))
+## plot the season variables
+par(mfrow = c(3,1))
+plot(S$SEASON_COS~S$SAMPLEDATE)
+plot(S$SEASON_SIN~S$SAMPLEDATE)
+plot(S$SEASON_CAT)
+
+# Make sure the GROUP3 variable is last
+S <- S[,c(1:(which(colnames(S)=="GROUP3")-1),
+          (which(colnames(S)=="GROUP3")+1):ncol(S),
+          which(colnames(S)=="GROUP3"))]
+
+# Make a wide format again, for comparison of clinical values between timepoints
+Swide <- S[,-which(colnames(S)=="GROUP3")] %>% pivot_wider(names_from = "Timepoint",
+                           values_from = c("AGE","BMI","SMOKING_CURRENT","ARTGROUP","SampleID","SAMPLEDATE",
+                                           "SEASON_CAT","SEASON_SIN","SEASON_COS","Days_since_Jan2001","inclusion_month","STORAGE_TIME"))
+```
+#### Export the cleaned dataset for Time & ART, together with the olink data and info on ART types
+```{r}
+merge_df <- left_join(S, olink,by = "SampleID")
+
+# Read additional ART data
+artinfo <- openxlsx::read.xlsx(paste0(working_dir,"Inputs/Olink_SHM_ECVC_preART_vs_postART_206samp_2420Prots_masterdata.xlsx"))
+artinfo <- artinfo[,c("COMP_1_ID",
+           "T2_ART_DUR_DAYS",
+           "T2_INSTI", "T2_NNRTI", "T2_PI")]
+artinfo <- artinfo[grep("T2",artinfo$COMP_1_ID),] # only the T2 samples contain the ART info
+colnames(artinfo)[1] <- "SampleID"
+
+# join with main dataset
+dfart <- left_join(merge_df, artinfo, by = "SampleID")
+
+saveRDS(dfart, paste0(working_dir, "Outputs/AthenaOlink_Time_ART_Paired_Cleaned.rds"))
+```
+
+
+### Summary of time difference for groups
+```{r}
+# what is the time window between T1 and T2? For each GROUP type
+Swide$TIMEDIFF_YRS <- as.numeric(Swide$SAMPLEDATE_T2 - Swide$SAMPLEDATE_T1)/365.25
+
+timepassed <- data.frame(EC_ARTnaive = 19, EC_onART = 9, VCpersistent_ARTnaive = 23, VCpersistent_onART = 57, VCtransient_onART = 36, row.names = "N")
+
+{EC_ARTnaive <- summary(Swide$TIMEDIFF_YRS[which(Swide$ARTGROUP_T2 == "ARTnaiveT2" & Swide$ECVC == "EC")])
+EC_onART <- summary(Swide$TIMEDIFF_YRS[which(Swide$ARTGROUP_T2 == "onART" & Swide$ECVC == "EC")])
+VCpersistent_ARTnaive <- summary(Swide$TIMEDIFF_YRS[which(Swide$ARTGROUP_T2 == "ARTnaiveT2" & Swide$ECVC == "VCpersistent")])
+VCpersistent_onART <- summary(Swide$TIMEDIFF_YRS[which(Swide$ARTGROUP_T2 == "onART" & Swide$ECVC == "VCpersistent")])
+VCtransient_onART <- summary(Swide$TIMEDIFF_YRS[which(Swide$ARTGROUP_T2 == "onART" & Swide$ECVC == "VCtransient")])}
+
+timepassed["Time difference (years)",] <- 
+  c(paste0(round(EC_ARTnaive[3],1),
+          " (",round(EC_ARTnaive[2],1),
+          " - ",round(EC_ARTnaive[5],1),
+          ")"),
+    paste0(round(EC_onART[3],1),
+          " (",round(EC_onART[2],1),
+          " - ",round(EC_onART[5],1),
+          ")"),
+    paste0(round(VCpersistent_ARTnaive[3],1),
+          " (",round(VCpersistent_ARTnaive[2],1),
+          " - ",round(VCpersistent_ARTnaive[5],1),
+          ")"),
+    paste0(round(VCpersistent_onART[3],1),
+          " (",round(VCpersistent_onART[2],1),
+          " - ",round(VCpersistent_onART[5],1),
+          ")"),
+    paste0(round(VCtransient_onART[3],1),
+          " (",round(VCtransient_onART[2],1),
+          " - ",round(VCtransient_onART[5],1),
+          ")"))
+
+# How long are the EC and VC on ART?
+Swide$TIMEART_YRS <- as.numeric(Swide$SAMPLEDATE_T2 - Swide$ART_START)/365.25
+summary(Swide$TIMEART_YRS)
+
+{EC_ARTnaive <- summary(Swide$TIMEART_YRS[which(Swide$ARTGROUP_T2 == "ARTnaiveT2" & Swide$ECVC == "EC")])
+EC_onART <- summary(Swide$TIMEART_YRS[which(Swide$ARTGROUP_T2 == "onART" & Swide$ECVC == "EC")])
+VC_ARTnaive <- summary(Swide$TIMEART_YRS[which(Swide$ARTGROUP_T2 == "ARTnaiveT2" & Swide$ECVC == "VC")])
+VCpersistent_onART <- summary(Swide$TIMEART_YRS[which(Swide$ARTGROUP_T2 == "onART" & Swide$ECVC == "VCpersistent")])
+VCtransient_onART <- summary(Swide$TIMEART_YRS[which(Swide$ARTGROUP_T2 == "onART" & Swide$ECVC == "VCtransient")])
+}
+
+timepassed["Time on ART (years)",] <- 
+  c(paste0(round(EC_ARTnaive[3],1),
+          " (",round(EC_ARTnaive[2],1),
+          " - ",round(EC_ARTnaive[5],1),
+          ")"),
+    paste0(round(EC_onART[3],1),
+          " (",round(EC_onART[2],1),
+          " - ",round(EC_onART[5],1),
+          ")"),
+    paste0(round(VC_ARTnaive[3],1),
+          " (",round(VC_ARTnaive[2],1),
+          " - ",round(VC_ARTnaive[5],1),
+          ")"),
+    paste0(round(VCpersistent_onART[3],1),
+          " (",round(VCpersistent_onART[2],1),
+          " - ",round(VCpersistent_onART[5],1),
+          ")"),
+    paste0(round(VCtransient_onART[3],1),
+          " (",round(VCtransient_onART[2],1),
+          " - ",round(VCtransient_onART[5],1),
+          ")"))
+timepassed
+
+openxlsx::write.xlsx(cbind(rownames(timepassed),timepassed),paste0(working_dir, "Outputs/Supplements_ECVCART_timediff.xlsx"),asTable = T)
+```
+
+
+### Evaluate clinical characteristics between groups
+Remove the single patient with unknown LOSS, i.e. VL exactly 10,000 at T2 sample.
+```{r}
+S <- S[-which(is.na(S$GROUP3)),]
+```
+
+```{r}
+ggsave(paste0(working_dir, "Outputs/Supplements_ECVCART_Demographics_between_groups1.pdf"),
+       suppressWarnings(gridExtra::grid.arrange(
+
+# continuous variables
+
+  ggplot(S,aes(x=GROUP3, y=AGE)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("AGE",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$AGE~S$GROUP3)$p.value,3))),
+
+  ggplot(S,aes(x=GROUP3, y=SEASON_SIN)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("SEASON_SIN",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$SEASON_SIN~S$GROUP3)$p.value,3))),
+  
+  ggplot(S,aes(x=GROUP3, y=SEASON_COS)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("SEASON_COS",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$SEASON_COS~S$GROUP3)$p.value,3))),
+  
+  ggplot(S,aes(x=GROUP3, y=BMI)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("BMI",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$BMI~S$GROUP3)$p.value,3))),
+
+  ggplot(S,aes(x=GROUP3, y=STORAGE_TIME)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("STORAGE_TIME",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$STORAGE_TIME~S$GROUP3)$p.value,3))),
+
+  ggplot(S,aes(x=GROUP3, y=VL)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("VL",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$VL~S$GROUP3)$p.value,3))),
+
+  ggplot(S,aes(x=GROUP3, y=CD4)) + 
+    geom_jitter(shape=16, position=position_jitter(0.2),size = .1) +
+    geom_boxplot(width = .5,outlier.shape = NA) +
+    theme_bw() + theme(axis.text.x = element_text(colour="black", angle=45, hjust =1)) + xlab("") +
+    ggtitle("CD4",subtitle = paste("Kruskal-Wallis P =",signif(kruskal.test(S$CD4~S$GROUP3)$p.value,3))),
+
+# categorical variables
+  
+  ggplot(S, aes(GROUP3))+
+    geom_bar(aes(fill=as.factor(SEX)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1))+
+    ggtitle("SEX",subtitle = paste("Chi squared P =",signif(chisq.test(S$SEX,S$GROUP3)$p.value,3)))
+
+,ncol = 2)),
+       width = 210, height = 297, units = "mm") # A4 size 
+
+# make a second page, it doesn't fit otherwise
+ggsave(paste0(working_dir, "Outputs/Supplements_ECVCART_Demographics_between_groups2.pdf"),
+       suppressWarnings(gridExtra::grid.arrange( 
+  ggplot(S, aes(GROUP3))+
+    geom_bar(aes(fill=as.factor(CENTER)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1))+
+    ggtitle("CENTER",subtitle = paste("Chi squared P =",signif(chisq.test(S$CENTER,S$GROUP3)$p.value,3))),
+  
+  ggplot(S, aes(GROUP3))+
+    geom_bar(aes(fill=as.factor(SEASON_CAT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1))+
+    ggtitle("SEASON_CAT",subtitle = paste("Chi squared P =",signif(chisq.test(S$SEASON_CAT,S$GROUP3)$p.value,3))),
+  
+  ggplot(S, aes(GROUP3))+
+    geom_bar(aes(fill=as.factor(ETHNICITY)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1))+
+    ggtitle("ETHNICITY",subtitle = paste("Chi squared P =",signif(chisq.test(S$ETHNICITY,S$GROUP3)$p.value,3))),
+  
+  ggplot(S, aes(GROUP3))+
+    geom_bar(aes(fill=as.factor(SMOKING_CURRENT)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1))+
+    ggtitle("SMOKING_CURRENT",subtitle = paste("Chi squared P =",signif(chisq.test(S$SMOKING_CURRENT,S$GROUP3)$p.value,3))),
+
+  ggplot(S, aes(GROUP3))+
+    geom_bar(aes(fill=as.factor(SMOKING_NEVER)), position="fill", width = 0.5, color = "black") + 
+    theme_bw() + labs(fill="") + theme(axis.text.x = element_text(angle=45, hjust=1))+
+    ggtitle("SMOKING_NEVER",subtitle = paste("Chi squared P =",signif(chisq.test(S$SMOKING_NEVER,S$GROUP3)$p.value,3)))
+
+,ncol = 2)),
+       width = 210, height = 297, units = "mm") # A4 size 
+```
+#### Interpretation
+
+* AGE is different between the samples
+* SEASON_COS and SEASON_SIN are only slightly different between the samples, as is categorical season
+* STORAGE_TIME is severly skewed between samples.
+* BMI is similar
+* SEX is similar between paired comparisons: only the EC who do not start ART are more often female, but between ART groups this is similar.
+* CENTER is different between the paired comparisions: Expecially EMC and MSZ contribution varies
+* ETHNICITY is slightly different between comparisons, mainly the proportion of white, black and unknown. 
+* SMOKING seems to minimally decrease in general; however, the number of NA varies more.
+
+In summary: AGE, seasonality, STORAGE_TIME are very important to evaluate. CENTER, ETHNICITY and SEX are inherently stable within comparisons and could be evaluated as sensitivity, to see if the effect of time and ART is different between CENTER, ETHNICITIES or SEXES.
+
+### ADDENDUM 26-1-2025: what were the VL of the 9 EC_preART like at start ART?
+paired samples available for:	
+  Detectable at T1	DATE RNA	VL	START ART	Detectable at ART
+1	Detectable viremia 50-1000 copies/mL at ART	11-5-2017	1417	29-5-2017	ja detectable
+2	Detectable viremia 50-1000 copies/mL at ART	22-4-2014	480	25-4-2014	ja detectable
+3	Detectable viremia 50-1000 copies/mL at ART	8-9-2014	404	25-11-2014	ja detectable
+4	Undetectable at ART	25-11-2013	4960	1-5-2014	ja detectable
+5	Undetectable at ART	27-12-2016	1000	16-1-2017	ja detectable
+6	Undetectable at ART	15-10-2019	393	17-10-2019	ja detectable
+7	Undetectable at ART	28-6-2019	79	28-6-2019	ja detectable
+8	Undetectable at ART	9-2-2017	2513	30-3-2017	ja detectable
+9	Detectable viremia 50-1000 copies/mL at ART	28-10-2010	61	10-11-2010	ja detectable
+
+
+```{r}
+ECONLY_ART <- S %>%
+  filter(GROUP3 == "EC_preART") %>%
+  mutate(UNDETECTABLE_AT_ART = case_when(
+    as.numeric(T1_VL) < 50 ~ "Undetectable at ART",
+    as.numeric(T1_VL) >= 50 ~ "Detectable viremia 50-1000 copies/mL at ART",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(UNDETECTABLE_AT_ART = as.factor(UNDETECTABLE_AT_ART)) %>%
+  select(matches("ID|SampleID|UNDETECTABLE_AT_ART|VL")) %>%
+  droplevels()
+
+summary(ECONLY_ART$UNDETECTABLE_AT_ART)
+
+temp <- ECONLY_ART %>% 
+  mutate(SampleID = str_replace(SampleID, "_T1$", "_T2"))
+
+ECONLY_ART <- ECONLY_ART %>% 
+  bind_rows(temp) %>% 
+  left_join(olink, by = "SampleID") %>%
+  mutate(Time = stringr::str_split_i(SampleID, "_", 2)) %>%
+  select(ID, SampleID, Time, UNDETECTABLE_AT_ART, LY9, CD6, CRTAM, VAT1)
+
+
+```
+
+Boxplots stratisfied by Undetectable at ART for the 4 markers.
+
+```{r}
+# ECONLY_ART
+# pivot longer again for ggplot facet grid/wrap
+ECONLY_ARTlong <- ECONLY_ART %>%
+  pivot_longer(
+    cols = c(LY9, CD6, CRTAM, VAT1),
+    names_to = "Protein",
+    values_to = "Value",
+  ) %>%
+  select(ID, Time, UNDETECTABLE_AT_ART, Protein, Value)
+
+g <- ggplot(ECONLY_ARTlong, aes(x = Time, y = Value, fill = UNDETECTABLE_AT_ART))+
+  geom_violin(alpha=0.3, position = position_dodge(width = .9), linewidth=.1, color=NA) +
+  ggtitle("Delta NPX")+
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_dodge2(width = 0.75), 
+               aes(color = UNDETECTABLE_AT_ART),alpha=.5)+
+  ylab(c("Delta Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_grid(Protein~UNDETECTABLE_AT_ART, scales = "free")+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("blue4", "darkgrey"))+
+  scale_color_manual(values=c("blue4", "darkgrey"))+
+  theme(legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(color=  "black"),
+    axis.ticks.x = element_blank())
+
+ggsave(paste0(working_dir, "Outputs/Supplements_Figure_PAIRED_EConlyART_CRTAMLY9CD6VAT1.pdf"),g, dpi = 300,width = 210/2, height = 297/2, units = "mm" ) 
+
+g <- g + geom_line(linewidth =  0.5, color = "black", aes(group = ID), alpha = 0.3, position = position_dodge(width = 0.75))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_Figure_PAIRED_WITHLINES_EConlyART_CRTAMLY9CD6VAT1.pdf"),g, dpi = 300,width = 210/2, height = 297/2, units = "mm" )
+
+# Paired T test, split by ECONLY_ARTWIDE
+# pivot wider
+ECONLY_ARTwide <- ECONLY_ART %>%
+  mutate(TIME = stringr::str_split_i(SampleID, "_", 2)) %>%
+  pivot_wider(
+    id_cols = c(ID, UNDETECTABLE_AT_ART),
+    names_from = TIME,
+    values_from = c(LY9, CD6, CRTAM, VAT1)
+  )
+# calculate delta npx
+ECONLY_ARTwide <- ECONLY_ARTwide %>% 
+  mutate(
+    LY9_deltaNPX = abs(LY9_T1 - LY9_T2),
+    CD6_deltaNPX = abs(CD6_T1 - CD6_T2),
+    CRTAM_deltaNPX = abs(CRTAM_T1 - CRTAM_T2),
+    VAT1_deltaNPX = abs(VAT1_T1 - VAT1_T2)
+  )
+
+vldetect <- ECONLY_ARTwide %>% filter(UNDETECTABLE_AT_ART == "Detectable viremia 50-1000 copies/mL at ART")
+
+vlundetect <- ECONLY_ARTwide %>% filter(UNDETECTABLE_AT_ART == "Undetectable at ART")
+
+printpvalues_paired <- function(df){
+  for (protein_colname in c("LY9", "CD6", "CRTAM", "VAT1")){
+    df <- data.frame(df)
+    print(protein_colname)
+    T1name <- paste0(protein_colname, "_T1")
+    T2name <- paste0(protein_colname, "_T2")
+    pvalue <- signif(t.test(df[,T1name] , df[,T2name], paired = TRUE)$p.value,3)
+    print(paste0("P = ", pvalue))
+    print('')
+  }
+}
+
+printpvalues_paired(vldetect)
+printpvalues_paired(vlundetect)
+
+df <- data.frame(ECONLY_ARTwide)
+# t.test(df[,"LY9_T1"], df[,"LY9_T2"], paired = TRUE)
+
+newdf <- ECONLY_ARTlong %>% mutate(Time = case_when(Time == "T1" ~ "Before ART",
+                                                    Time == "T2" ~ "After ART"))
+
+# Boxplot for all 9 EC before and after
+g <- ggplot(newdf, aes(x = Time, y = Value, fill = "black"))+
+  geom_violin(alpha=0.3, position = position_dodge(width = .9), linewidth=.1, color=NA) +
+  ggtitle("Change in Normalized Protein Expression (NPX) in N = 9 EC before and after ART")+
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_dodge2(width = 0.75), 
+               aes(color = "black"),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_grid(.~Protein, scales = "free")+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("yellow3", "darkgrey"))+
+  scale_color_manual(values=c("yellow3", "darkgrey"))+
+  theme(legend.position = "none",
+    axis.text.x = element_text(color=  "black", size = 8),
+    axis.text.y = element_text(color=  "black", size = 8),
+    axis.ticks.x = element_blank())
+
+ggsave(paste0(working_dir, "Outputs/Supplements_Figure_PAIRED_EConlyART_CRTAMLY9CD6VAT1_Unstratified.pdf"),g, dpi = 300,width = 210/1, height = 297/4, units = "mm" ) 
+
+g <- g + geom_line(linewidth =  0.5, color = "black", aes(group = ID), alpha = 0.3, position = position_dodge(width = 0.75))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_Figure_PAIRED_WITHLINES_EConlyART_CRTAMLY9CD6VAT1_Unstratified.pdf"),g, dpi = 300,width = 210/1, height = 297/4, units = "mm" )
+```
+
+Also do delta NPX.
+And t-test because of small sample size.
+
+```{r}
+# pivot longer again for ggplot facet grid/wrap
+ECONLY_ARTdeltaNPX <- ECONLY_ARTwide %>%
+  pivot_longer(
+    cols = c(LY9_deltaNPX, CD6_deltaNPX, CRTAM_deltaNPX, VAT1_deltaNPX),
+    names_to = "Protein",
+    values_to = "deltaNPX"
+  ) %>%
+  select(ID, UNDETECTABLE_AT_ART, Protein, deltaNPX)
+  
+# boxplot delta npx between the two groups
+g <- ggplot(ECONLY_ARTdeltaNPX, aes(x = UNDETECTABLE_AT_ART, y = deltaNPX, fill = UNDETECTABLE_AT_ART))+
+  geom_violin(alpha=0.3, position = position_dodge(width = .9), linewidth=.1, color=NA) +
+  ggtitle("Delta NPX")+
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_dodge2(width = 0.75), 
+               aes(color = UNDETECTABLE_AT_ART),alpha=.5)+
+  ylab(c("Delta Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("blue4", "darkgrey"))+
+  scale_color_manual(values=c("blue4", "darkgrey"))+
+  theme(legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(color=  "black"),
+    axis.ticks.x = element_blank())
+
+ggsave(paste0(working_dir, "Outputs/Supplements_Figure_DeltaNPX_EConlyART_CRTAMLY9CD6VAT1.pdf"),g, dpi = 300,width = 210/2, height = 297/4, units = "mm" ) 
+
+# statistical testing
+df <- data.frame(ECONLY_ARTwide)
+for (protein_colname in c("LY9_deltaNPX", "CD6_deltaNPX", "CRTAM_deltaNPX", "VAT1_deltaNPX")){
+  print(stringr::str_split_i(protein_colname,"_",1))
+  print(paste0("P = ",signif(t.test(df[,protein_colname]~df$UNDETECTABLE_AT_ART)$p.value,3)))
+  print('')
+}
+
+```
+
+#### Extra check: ART regimens for EC only
+```{r}
+# Read additional ART data
+artinfo <- readxl::read_xlsx(paste0(working_dir, "Inputs/Olink_SHM_ECVC_preART_vs_postART_206samp_2420Prots_masterdata.xlsx")) %>%
+  select(COMP_1_ID, T2_ART_DUR_DAYS, T2_INSTI, T2_NNRTI, T2_PI) %>%
+  filter(str_detect(COMP_1_ID, "T2")) %>%
+  rename(SampleID = COMP_1_ID)
+
+# Join with other dataset
+artinfo <- ECONLY_ART %>% filter(str_detect(SampleID, "_T2$")) %>%
+  left_join(artinfo, by = "SampleID")
+
+# Create tables
+c("T2_ART_DUR_DAYS", "T2_INSTI", "T2_NNRTI", "T2_PI") %>%
+  map(~table(artinfo[[.x]], artinfo$UNDETECTABLE_AT_ART))
+```
+# Cleaning longitudinal data: survival models loss of control status
+
+### Read and clean the data
+
+*Note: FU stands for follow-up*
+
+In the dataset, the following variables and their meanings are:
+* T1_DATE is start of follow-up
+* EVENT_DATE is LOSS_DATE # I checked: this is always before ART_START
+* LOSS_DATE is the first date that VL reaches >10,000 c/mL
+* LATEST_DATE is the last available entry in the SHM dataset
+* FU_TOTAL is the time in years betweeen HIV diagnosis and LATEST_DATE
+* FU_END is the minimum of LOSS_DATE, ART_START and LATEST_DATE with `na.rm=T`
+* HIV_DATE can be derived from HIV_DUR_T1 and T1_DATE
+
+For survival analyses,:
+* T1_DATE is start of follow-up
+* FU_END is the time in days end of follow-up, censored at ART_START or end of follow-up where applicable
+* FU_END_DATE can be derived by adding FU_END to T1_DATE.
+* STATUS is event yes/no, which can be derived from LOSS, a factor with two levels: Kept_EC_status and Lost_EC_status
+* CENSORED can be derived from LOSS == Kept_EC_status & ART == 1
+
+```{r}
+# read data
+df <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_ECVC_Loss_vs_NoLoss_181samp_2420Prots_masterdata.xlsx"))
+colnames(df)[1] <- "SampleID"
+
+# 3 individuals with the note "no 6 months ART", set to NA
+df[which(df$ART_START == "no 6 months ART"),"ART_START"] <- NA
+
+# Prepare dataset
+df <- df %>%  
+  # Define STATUS (event yes/no where 1 == event happened and 0 == no event)
+  mutate(STATUS = case_when(LOSS == "Kept_EC_status"~ 0,
+                            LOSS == "Lost_EC_status"~ 1)) %>%
+  # Define END_DATE which is FU_END plus T1_DATE
+  mutate(FU_END_DATE = FU_END + T1_DATE) %>%
+  # CENSORED if ART is started without Loss. Note that Loss always comes before ART in this dataset.
+  mutate(CENSORED_ART = case_when(LOSS == "Kept_EC_status" & ART == 1 ~ 1,
+                              LOSS == "Lost_EC_status" | ART == 0 ~ 0)) %>%
+  # define HIV_DATE with HIV_DUR_T1 and T1_DATE. Note that HIV_DUR_T1 is in years
+  mutate(HIV_D = T1_DATE - (HIV_DUR_T1*365.25)) %>%
+  # rename age and storage time colnames, 
+  dplyr::rename(AGE = AGE_T1, STORAGE_TIME = Storage_time) %>%
+  # define ethnicity_white and ethnicity_black
+  mutate(ETHNICITY_WHITE = case_when(ETHNICITY == "White" ~ 1,
+                                     ETHNICITY != "White" & !is.na(ETHNICITY) ~ 0),
+         ETHNICITY_BLACK = case_when(ETHNICITY == "Black" ~ 1,
+                                     ETHNICITY != "Black" & !is.na(ETHNICITY) ~ 0)) %>%
+  # CENTER dummy variables
+  mutate(CENTER_EMC = case_when(CENTER == "EMC" ~ 1, CENTER != "EMC" ~ 0),
+          CENTER_LUMC = case_when(CENTER == "LUMC" ~ 1, CENTER != "LUMC" ~ 0),
+          CENTER_MSZ = case_when(CENTER == "MSZ" ~ 1, CENTER != "MSZ" ~ 0),
+          CENTER_OLVG = case_when(CENTER == "OLVG" ~ 1, CENTER != "OLVG" ~ 0),
+          CENTER_RAD = case_when(CENTER == "RAD" ~ 1, CENTER != "RAD" ~ 0),
+          CENTER_UMCU = case_when(CENTER == "UMCU" ~ 1, CENTER != "UMCU" ~ 0)) %>%
+  # transform factors
+  mutate_at(c("CENTER", "COHORT", "SEX", "NONVIREMIC", "ETHNICITY", "ETHNICITY_WHITE",
+               "ETHNICITY_BLACK","SMOKING_CURRENT_T1", "SMOKING_EVER_T1",
+               "ART", "LOSS", "CENTER_EMC","CENTER_LUMC","CENTER_MSZ",
+               "CENTER_OLVG","CENTER_RAD","CENTER_UMCU"), as.factor) %>%
+  # transform dates
+  mutate_at(c("T1_DATE","ART_START","LOSS_DATE","LATEST_DATE","FU_END_DATE","HIV_D"),
+                   openxlsx::convertToDate)
+
+  # select variables
+colnames_olink = colnames(df)[c(grep("GP2", colnames(df)): grep("NFU1", colnames(df)))]
+columns_to_select <- c(
+  "SampleID", "T1_DATE", "T1_VL", "HIV_D",
+  "ART", "ART_START", "LOSS", "LOSS_DATE", "LATEST_DATE", "NONVIREMIC",
+  "FU_TOTAL", "FU_END", "FU_END_DATE", "CENSORED_ART", "STATUS", 
+  "AGE", "SEX", "CENTER", "CENTER_EMC", "CENTER_LUMC", "CENTER_MSZ",
+  "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+  "STORAGE_TIME", "ETHNICITY", "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+  colnames_olink
+)
+
+df <- df[, columns_to_select]
+
+table(df$LOSS, df$NONVIREMIC)
+table(df$LOSS, df$CENSORED_ART)
+
+# Read VL data
+dynamic_vl <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/20230729_ALL_CD4_VL_eliteATHENA.xlsx"),sheet=3) %>% 
+  dplyr::mutate(RNA_D = openxlsx::convertToDate(RNA_D),
+                YEAR_FU = lubridate::year(RNA_D), # taking the year reduces resolution
+                RNA_c= ifelse(RNA_UDT==1 | RNA<50,50,RNA)) #change undetected RNA per center to 50 (Lower detection limit) #anything below 50 to 50 (Lower detection limit) 4551 observations
+colnames(dynamic_vl)[1] <- "SampleID"
+
+head(dynamic_vl)
+
+# Join LOSS, NONVIREMIC, T1_DATE, FU_END_DATE
+dynamic_vl <- left_join(dynamic_vl, df[,c("SampleID","LOSS","LOSS_DATE", "NONVIREMIC", "T1_DATE", "T1_VL", "FU_END_DATE", "HIV_D")], by = "SampleID")
+
+# remove the measurements from IDs that are not in the final dataset
+dynamic_vl <- dynamic_vl[-which(is.na(dynamic_vl$LOSS)),]
+
+# VL measurements must be from on or before FU_END_DATE, which is loss, ART or end of follow-up
+dynamic_vl <- dynamic_vl[which(dynamic_vl$RNA_D <= dynamic_vl$FU_END_DATE),]
+
+# add time in years since first measurement
+dynamic_vl <- dynamic_vl %>% group_by(SampleID) %>% 
+  mutate(OLDEST = min(RNA_D)) %>% 
+  mutate(YEARS_SINCE_T0 = as.numeric((RNA_D - OLDEST)/365.25)) %>%
+  mutate(YEARS_SINCE_HIV = as.numeric((RNA_D - HIV_D)/365.25))
+
+dynamic_vl$YEARS_SINCE_T0_ROUNDED <- round(dynamic_vl$YEARS_SINCE_T0,0)
+
+```
+
+Note that for N=2 individuals we do not have longitudinal VL data available.
+
+#### Export the dataframe
+
+```{r}
+saveRDS(df, paste0(working_dir, "Outputs/AthenaOlink_Loss_vs_NoLoss_Cleaned.rds"))
+
+saveRDS(dynamic_vl, paste0(working_dir, "Outputs/AthenaOlink_Longitudinal_ViralLoad_Cleaned.rds"))
+```
+
+## Add CD4 dynamics
+### Read and clean CD4 data
+```{r}
+# Read CD4 data
+dynamic_cd4 <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/20230729_ALL_CD4_VL_eliteATHENA.xlsx"),sheet=2) %>% 
+  dplyr::mutate(CD4_D = openxlsx::convertToDate(CD4_D))
+colnames(dynamic_cd4)[1] <- "SampleID"
+
+# Join LOSS, NONVIREMIC, T1_DATE, FU_END_DATE
+dynamic_cd4 <- left_join(dynamic_cd4, df[,c("SampleID","LOSS","LOSS_DATE", "NONVIREMIC", "T1_DATE", "T1_VL", "FU_END_DATE", "HIV_D")], by = "SampleID")
+# Also join T1_CD4
+addt1cd4 <- openxlsx::read.xlsx(paste0(working_dir, "Inputs/Olink_SHM_ECVC_Loss_vs_NoLoss_181samp_2420Prots_masterdata.xlsx"))
+colnames(addt1cd4)[1] <- "SampleID"
+dynamic_cd4 <- left_join(dynamic_cd4,addt1cd4[,c("SampleID", "T1_CD4")], by = "SampleID")
+
+# remove the measurements from IDs that are not in the final dataset
+dynamic_cd4 <- dynamic_cd4[-which(is.na(dynamic_cd4$LOSS)),]
+
+# VL measurements must be from on or before FU_END_DATE, which is loss, ART or end of follow-up
+dynamic_cd4 <- dynamic_cd4[which(dynamic_cd4$CD4_D <= dynamic_cd4$FU_END_DATE),]
+
+# add time in years since first measurement
+dynamic_cd4 <- dynamic_cd4 %>% group_by(SampleID) %>% 
+  mutate(OLDEST = min(CD4_D)) %>% 
+  mutate(YEARS_SINCE_T0 = as.numeric((CD4_D - OLDEST)/365.25),
+         YEARS_SINCE_T1 = as.numeric((CD4_D - T1_DATE)/365.25),
+         YEARS_SINCE_HIV = as.numeric((CD4_D - HIV_D)/365.25))
+
+length(unique(dynamic_cd4$SampleID))
+
+# make sure dates are in ascending order for moving median
+dynamic_cd4 <- dynamic_cd4 %>% arrange(SampleID, CD4_D)
+
+# test moving median out with one patient
+test <- dynamic_cd4 %>% filter(PID == dynamic_cd4$PID[100])
+test <- test[,c(1:5,12)]
+library(slider)
+test$rollingmean <- slide_mean(test$CD4A,before = 2, after = 2,na_rm = T)
+test$rollingmean_index <- slide_index_mean(x = test$CD4A, i = test$CD4_D, before = 365, after = 365, na_rm = T)
+test$rollingmedian_index <- slide_index_dbl(.x = test$CD4A, .i = test$CD4_D, .f = median, .before = 365, .after = 365)
+test[,c(3:8)]
+
+# add a moving median with index window -365 to +365 days.
+dynamic_cd4 <- dynamic_cd4 %>% group_by(SampleID) %>% mutate(
+  rollingmedian_index = slide_index_dbl(.x = CD4A, .i = CD4_D, .f = median, .before = 365, .after = 365))
+
+# new df with only after T1
+cd4_T1 <- dynamic_cd4 %>% filter(CD4_D > (T1_DATE - 30)) %>% # minus 30 since some are right before T1
+  mutate(YEARS_SINCE_T1 = case_when(YEARS_SINCE_T1 < 0 ~ 0,
+                   YEARS_SINCE_T1 >= 0 ~ YEARS_SINCE_T1)) # set those with negative Time since T1 to zero
+
+cd4_T1$YEARS_SINCE_T1_ROUNDED <- round(cd4_T1$YEARS_SINCE_T1,0)
+
+# double check the data
+# cd4_T1[,c(1:4,16,5,17)]
+```
+
+#### How many EC and VC had CD4 <500 at sampling?
+```{r}
+addt1cd4 <- addt1cd4 %>% mutate(CD4le500 = case_when(T1_CD4 < 500 ~ "Below 500",
+                                                     T1_CD4 >= 500 ~ "Above 500"),
+                                ECVC = case_when(NONVIREMIC == 1 & LOSS == "Kept_EC_status" ~ "EC_persistent",
+                                                 NONVIREMIC == 1 & LOSS == "Lost_EC_status" ~ "EC_transient",
+                                                 NONVIREMIC == 0 & LOSS == "Kept_EC_status" ~ "VC_persistent",
+                                                 NONVIREMIC == 0 & LOSS == "Lost_EC_status" ~ "VC_transient",))
+cd4summ <- table(addt1cd4$CD4le500, addt1cd4$ECVC)
+cd4summ
+round(cd4summ / c(33,33,1,1,90,90,55,55) * 100,1)
+cd4summ <- data.frame(cd4summ[1], cd4summ[2], cd4summ[3], cd4summ[4])
+```
+
+#### Predict reaching moving median CD4 <500 for EC and VC
+
+We have longitudinal CD4 data after T1 for 177 individuals.
+
+There are n=45 individuals who have a CD4 <500 at T1. However, there are several individuals who have a moving median >500 at T1, suggesting that it was an isolated measurement.
+
+```{r}
+# N = 177 individuals
+length(unique(cd4_T1$SampleID))
+
+# N = 45 individuals have CD4 count <500 at T1.
+length(unique(cd4_T1$SampleID[which(cd4_T1$T1_CD4 < 500)]))
+
+cd4_T1[which(cd4_T1$T1_CD4 < 500), c(3:4, 17) ]
+
+# change back to data.frame instead of tibble
+cd4_T1 <- as.data.frame(cd4_T1)
+for (i in c(1:nrow(cd4_T1))) {
+  id <- cd4_T1[i,"SampleID"]
+  startingcd4median <- cd4_T1[which(cd4_T1$SampleID == id)[1],"rollingmedian_index"] # take the first rolling median index of this patient
+  cd4_T1[i,"T1_rollingmedian"] <- startingcd4median }
+
+# N = 37 individuals have rolling median CD4 <500 at T1.
+length(unique(cd4_T1$SampleID[-which(cd4_T1$T1_rollingmedian < 500)]))
+
+# N = 138 individuals have rolling median CD4 >500 at T1.
+length(unique(cd4_T1$SampleID[which(cd4_T1$T1_rollingmedian > 500)]))
+
+# N = 2 individuals have rolling median of exactly 500 at T1
+cd4_T1[which(cd4_T1$T1_rollingmedian == 500), c(3:4, 17) ]
+
+# subset the dataframe with only >500 at T1 in moving median
+cd4_T1_500 <- cd4_T1[which(cd4_T1$T1_rollingmedian > 500),]
+
+# Define the moment of immunological loss: moving median CD4 reaches <500 
+cd4_T1_500[which(cd4_T1_500$rollingmedian_index < 500),"IMMU_LOSS"] <- 1
+for (i in c(1:nrow(cd4_T1_500))) {
+  id <- cd4_T1_500[i,"SampleID"]
+  if (sum(cd4_T1_500[which(cd4_T1_500$SampleID == id),"IMMU_LOSS"],na.rm=T) > 0){
+    immulossdate <- min(cd4_T1_500[which(cd4_T1_500$SampleID == id &
+                           cd4_T1_500$IMMU_LOSS == 1),"CD4_D"], na.rm=T)
+    cd4_T1_500[i,"IMMU_LOSS_D"] <- immulossdate
+    cd4_T1_500[i,"IMMU_LOSS_EVER"] <- 1
+  }else{ cd4_T1_500[i,"IMMU_LOSS_EVER"] <- 0}}
+cd4_T1_500$IMMU_LOSS_EVER <- as.factor(cd4_T1_500$IMMU_LOSS_EVER)
+
+# How many? N=42 with immu_loss, n=96 without.
+length(unique(cd4_T1_500$SampleID[which(cd4_T1_500$IMMU_LOSS_EVER == 1)])) 
+length(unique(cd4_T1_500$SampleID[which(cd4_T1_500$IMMU_LOSS_EVER == 0)]))
+```
+
+#### Export the dataframe
+
+```{r}
+saveRDS(cd4_T1_500, paste0(working_dir, "Outputs/AthenaOlink_Longitudinal_Cd4Counts_Cleaned.rds"))
+```

@@ -1,0 +1,1037 @@
+---
+title: "Olink ananlysis eliteATHENA and 2000HIV"
+author: "Albert Groenendijk & Nadira Vadaq"
+date: "2022-11-22"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+---
+
+Updated July and December 2023 and January 2024 by Nadira.
+Major revisions, refactor and expansions by Albert, starting 9 February 2024, further additions October and December 2024.
+
+```{r echo=T, results='hide', warning=F,message=F}
+working_dir <- c("HIV_controllers_ATHENA/AthenaOlink_SurvivalModels/")
+
+library(FactoMineR)
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(table1)
+library(ggbiplot)
+library(ggplot2)
+library(openxlsx)
+```
+
+## Read Cleaned Data AthenaOlink for longitudinal measurements and Loss vs No Loss
+
+```{r, warning=FALSE}
+dynamic_vl <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Longitudinal_ViralLoad_Cleaned.rds"))
+df <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Loss_vs_NoLoss_Cleaned.rds"))
+```
+
+In part 1, we looked at EC vs VC cross-sectionally.
+In part 2, we compared paired samples over time and before/after ART.
+In part 3 (current notebook), we make survival models to see which biomarkers are associated with future loss of control.
+
+Primarily the analysis focuses on loss of virological control, defined as reaching VL >10,000 copies/mL. 
+Additionally, an alternative definition is investigated: >1,000 copies/mL increase in rolling median. And finally, predictors of immunological loss are used.
+
+## PREDICTING loss of virological control
+
+Regarding covariates, we know that there is a slight difference between VC persistent and transient at baseline in VL, ETHNICITY_WHITE, CENTER.
+
+The data is the same as in part 1, except for N=2 individuals with unknown loss (VL is exactly 10,000 copies/mL before ART is started). The PC regression against covariates heatmap, therefore, also applies here.
+s
+
+### Line plot viral set point and years of follow-up per participant
+
+We have the exact longitudinal VL data for N=179 participants
+
+```{r}
+#Dot plot
+ggplot(data=dynamic_vl,aes(x=YEARS_SINCE_T0_ROUNDED,y=log10(RNA_c)))+
+  geom_hline(yintercept=log10(10000), linetype="dashed", color = "red")+
+  #geom_hline(yintercept=log10(550), linetype="dashed", color = "darkblue")+
+  scale_color_manual(values=c("#440154","#5ec962")) +
+  #geom_line(stat = 'identity',aes(colour=SampleID,group=SampleID))+
+  theme_bw()+   theme(legend.position='bottom', axis.text = element_text(size = 8, color = "black"))+
+  labs(title = "All historical plasma viral load measurements")+
+  geom_point(aes(colour=LOSS),size = 0.5)+ #LOSS
+  ylab("Viral Load")+
+  xlab('Years since first available HIV-RNA measurement')+
+  geom_smooth(aes(colour = LOSS), method = "loess", se = TRUE) 
+
+ggsave(paste0(working_dir, "Outputs/Figure3A_LOSS_Dotplot_LOESS_Loss56_noLoss123_log10VL_time.pdf"),plot=last_plot(),
+       width = 4, height =3, units = 'in', dpi = 300)
+```
+
+#### Try out different definitions for loss
+
+The definition of loss is >10,000 copies/mL. This makes a lot of sense and is clear for the story. 
+
+As sensitivity analyses, however, we should look at other definitions. If you look at the line plot 3A, at the purple dots/lines (persistent EC and VC), you see that from 10 years on, there are individuals who deviate strongly from the purple line and have increasing VL and are losing control. Only they start ART before they cross the threshold. We should find a definition that captures those individuals best, as well as EC. EC can barely lose control, because if an EC has increasing VL to >1,000c/mL, ART is usually started. Unless they actively refuse, no doctor treating an EC with increasing VL waits until >10,000 copies/mL.
+
+Every definition suffers from the fact that we do not have measurements at fixed intervals, and number of measurements and time between vary greatly across individuals.
+
+##### Definition 1000c/mL increase in moving median VL
+
+New definition is: 1000 copies/mL in the moving median relative to the moving median at T1_DATE, where moving median takes all VL measurements in 365 days before and 365 days after the measurement date. This definition does not suffer from isolated peaks and it is flexible with the number of measurements.
+
+Source on calculating moving mean and median: https://epirhandbook.com/en/moving-averages.html
+
+```{r}
+# Create new df
+df2 <- dynamic_vl
+df2$LOGRNA_c <- log10(df2$RNA_c)
+
+# test it out with one patient
+test <- df2 %>% filter(PID == "SHM-EL-02134")
+test <- test[,c(1,2,3,7,17)]
+library(slider)
+test$rollingmean <- slide_mean(test$RNA_c,before = 2, after = 2,na_rm = T)
+test$rollingmean_index <- slide_index_mean(x = test$RNA_c, i = test$RNA_D, before = 365, after = 365, na_rm = T)
+test$rollingmedian_index <- slide_index_dbl(.x = test$RNA_c, .i = test$RNA_D, .f = median, .before = 365, .after = 365)
+test[,c(3:7)]
+
+# apply it to the entire dataset
+df2 <- df2 %>% group_by(SampleID) %>% mutate(
+  rollingmean_index = slide_index_mean(x = RNA_c, i = RNA_D, before = 365, after = 365, na_rm = T),
+  rollingmedian_index = slide_index_dbl(.x = RNA_c, .i = RNA_D, .f = median, .before = 365, .after = 365))
+```
+##### Define the moment of 1000 c/mL increase in moving median, relative to T1
+
+We select only the measurements after T1. T1 is the sample date with proteomics data. We want to predict future increase in VL after the T1 sample.
+
+```{r}
+# only the VLs starting from T1
+df3 <- df2 %>% group_by(SampleID) %>% filter(RNA_D >= (T1_DATE-30)) %>% # -30 days because sometimes the measurement is not completely congruous with T1_DATE
+  # redefine oldest measurement
+  group_by(SampleID) %>% mutate(OLDEST = min(RNA_D))
+
+# define the starting median for each individual
+df3 <- as.data.frame(df3) # change back from tibble to dataframe
+for (id in df3$SampleID) { # for every ID
+  rownums <- which(df3$SampleID == id) # rownumbers with all measurements
+  df3[rownums,"startingvalue"] <- df3[min(rownums),"rollingmedian_index"] # the first row of this ID is the starting value
+}
+
+# define who experienced an increase of 1000 copies/mL in rollingmedian_index
+df3$LOSS1000 <- NA
+for (i in c(1:nrow(df3))){
+  ID <- df3[i, "SampleID"] 
+  if (sum(df3[which(df3$SampleID == ID),"LOSS1000"],na.rm = T) == 0 & 
+      df3[i,"rollingmedian_index"] >= (df3[i,"startingvalue"] + 1000)){
+    df3[i,"LOSS1000"] <- 1
+  }
+}
+
+# add new loss category and date for every ID 
+df3$LOSS1000_EVER <- "PERSISTENT"
+for (id in unique(df3$SampleID)) {
+  if (sum(df3[which(df3$SampleID == id),"LOSS1000"],na.rm = T) > 0) { # if there is one LOSS
+    df3[which(df3$SampleID == id),"LOSS1000_EVER"] <- "VL_INCREASE"
+    df3[which(df3$SampleID == id),"LOSS1000_DATE"] <- df3[which(df3$SampleID == id & df3$LOSS1000 == 1),"RNA_D"]
+  }
+}
+```
+
+##### Also define for EC the date they become detectable
+
+```{r}
+# flag the detectable dates after T1 for EC
+df5 <- df3 %>% filter(NONVIREMIC == 1) %>% mutate(FIRSTDETECT = case_when(RNA_c > 50 ~ 1))
+df5 <- as.data.frame(df5) # change back from tibble
+
+# define EC who ever were detectable after T1 for EC
+df5$FIRSTDETECT_DATE <- as.Date(NA)
+df5$FIRSTDETECT_EVER <- NA
+for (i in c(1:nrow(df5))){
+  ID <- df5[i, "SampleID"] 
+  if (length(which(df5$SampleID == ID & !is.na(df5$FIRSTDETECT))) > 0){
+    df5[i,"FIRSTDETECT_DATE"] <- df5[which(df5$SampleID == ID & !is.na(df5$FIRSTDETECT))[1],"RNA_D"]
+    df5[i,"FIRSTDETECT_EVER"] <- 1
+  } else {
+    df5[i,"FIRSTDETECT_EVER"] <- 0
+  }
+}
+
+# Double check the data
+#df5[,c("SampleID","RNA_D","RNA_c","FIRSTDETECT","FIRSTDETECT_DATE","FIRSTDETECT_EVER")]
+
+
+```
+
+##### Create hybrid definition
+
+The definition of loss is reaching the first of two criteria:
+- VL reaching >10,000 copies/mL
+- >1000 copies/mL increase in moving median relative to T1
+Where the moving median takes into account all measurements 1 year before to 1 year after viral load measurement.
+
+```{r}
+# in the dataset with only T1 measurements, create time variable time since T1 sample
+df3$YEARS_SINCE_T1 <- as.numeric((df3$RNA_D - df3$T1_DATE)/365.25) # time in years since T1_DATE
+df3$YEARS_SINCE_T1[which(df3$YEARS_SINCE_T1 <= 0)] <- 1/365.25 # at least one day for the cox regressions later
+
+# make new hybrid definition
+df3 <- df3 %>% mutate(LOSS_HYBRID = case_when(LOSS1000_EVER == "VL_INCREASE" | LOSS == "Lost_EC_status" ~ 1, 
+                                              LOSS1000_EVER == "PERSISTENT" & LOSS == "Kept_EC_status" ~ 0),
+                      LOSS_HYBRID_DATE = case_when(
+      LOSS1000_EVER == "VL_INCREASE" & LOSS != "Lost_EC_status" ~ LOSS1000_DATE,
+      LOSS1000_EVER != "VL_INCREASE" & LOSS == "Lost_EC_status" ~ LOSS_DATE,
+      LOSS1000_EVER == "VL_INCREASE" & LOSS == "Lost_EC_status" & LOSS_DATE <= LOSS1000_DATE ~ LOSS_DATE,
+      LOSS1000_EVER == "VL_INCREASE" & LOSS == "Lost_EC_status" & LOSS1000_DATE < LOSS_DATE ~ LOSS1000_DATE
+      )) %>% mutate_at(c("LOSS1000_EVER","LOSS_HYBRID"), as.factor)
+
+# check whether the hybrid dates are correct
+#df3[which(!is.na(df3$LOSS_HYBRID_DATE)),c(1,3,7,8,9,23,24,26,27)]
+
+# join the new hybrid definition info with the dataframe that contains all measurements
+df4 <- left_join(df2, unique(df3[,c("SampleID","LOSS1000_EVER","LOSS1000_DATE","LOSS_HYBRID","LOSS_HYBRID_DATE")]), by= "SampleID")
+
+# how many have virological loss in the new definition?
+temp <- unique(df4[,c("SampleID","LOSS1000_EVER","LOSS","LOSS_HYBRID")])
+summary(temp$LOSS)
+summary(as.factor(temp$LOSS1000_EVER))
+table(temp$LOSS, temp$LOSS1000_EVER)
+summary(as.factor(temp$LOSS_HYBRID))
+```
+
+### make line plots with new definition of VL increase
+
+```{r}
+g_hybrid <- ggplot(data=df3,aes(x=YEARS_SINCE_T1,y=log10(rollingmedian_index), group = SampleID))+
+  geom_hline(yintercept=log10(10000), linetype="dashed", color = "red")+
+  #geom_hline(yintercept=log10(550), linetype="dashed", color = "darkblue")+
+  scale_color_manual(values=c("#440154","darkorange")) +
+  theme_bw()+ theme(legend.position='none',
+        panel.grid.major.x = element_blank(),
+        axis.text = element_text(size = 8, color= "black"),
+        axis.title = element_text(size = 10, color= "black",face = "plain"),
+        plot.title = element_text(size = 10, color= "black"))+
+  labs(title = "Viral load moving median. Selection: only measurements after T1!", 
+       subtitle = "Definition: 1000 c/mL increase in moving median OR >10,000 copies/mL")+
+  geom_line(aes(colour=LOSS_HYBRID),alpha = 0.5,linewidth = 0.5)+ #LOSS_HYBRID
+  #geom_point(aes(colour=LOSS_HYBRID), size = 0.5)+ #LOSS_HYBRID
+  ylab("Log10 moving median of viral Load")+ xlab('Years since proteomics sample') +
+  ylim(log10(50),7) + xlim(0,20)
+
+## both but old definition
+g_old <- ggplot(data=df4,aes(x=YEARS_SINCE_T0,y=log10(RNA_c), group = SampleID))+
+  geom_hline(yintercept=log10(10000), linetype="dashed", color = "red")+
+  #geom_hline(yintercept=log10(550), linetype="dashed", color = "darkblue")+
+  scale_color_manual(values=c("#440154","#5ec962")) +
+  theme_bw()+ theme(legend.position='none',
+        panel.grid.major.x = element_blank(),
+        axis.text = element_text(size = 8, color= "black"),
+        axis.title = element_text(size = 10, color= "black",face = "plain"),
+        plot.title = element_text(size = 10, color= "black"))+
+  labs(title = "Viral load. All measurements", 
+       subtitle = "Definition: reaching >10,000 copies/mL")+
+  geom_line(aes(colour=LOSS),alpha = 0.5,linewidth = 0.5)+
+  ylab("Log10 viral Load")+ xlab('Years since first available HIV-RNA measurement') +
+  ylim(log10(50),7) + xlim(0,25)
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS4AB_LOSS_BOTHDEFINITIONS_Lineplot_Loss91_noLoss88_log10VL_afterT1_time.pdf")
+       , gridExtra::grid.arrange(g_old, g_hybrid, ncol =1), 
+       scale = 1, width = 4, height =6, units = 'in', dpi = 300)
+
+```
+
+### Define follow-up time and censoring for definition 2
+
+I want to plot both the survival curve of the old definition and the new definition in the same KM plot.
+
+Definition 1: reaching >10,000 copies/mL
+* Surv(FU_END, STATUS)
+
+FU_END here is the smallest: LOSS_DATE then START_ART then LATEST_DATE
+
+Definition 2: reaching >10,000 copies/mL OR a >1000 copies/mL increase in the moving median.
+* Surv(FU_END_HYBRID, LOSS_HYBRID)
+
+Note that LOSS_HYBRID is already coded as 1 = event happened and 0 = event did not happen. 
+FU_END_HYBRID here is the smallest: LOSS_HYBRID_DATE then START_ART then LATEST_DATE
+
+```{r}
+# add new definition
+df_surv <- left_join(df, unique(df4[,c("SampleID", "LOSS_HYBRID","LOSS_HYBRID_DATE")]), by = "SampleID")
+# also add the EC when they become 1st detectable after T1
+df_surv <- left_join(df_surv, unique(df5[,c("SampleID","FIRSTDETECT_DATE","FIRSTDETECT_EVER")]), by = "SampleID")
+
+# there are N=2 without longitudinal VL data
+# df_surv[which(is.na(df_surv$LOSS_HYBRID))] # to double check the data
+# these two have a VL_zenith of <50, and have always been undetectable (confirmed by clinicians).
+# we can set their LOSS_HYBRID to 0 # note that one of these starts ART during FU
+df_surv[which(is.na(df_surv$LOSS_HYBRID)),c("LOSS_HYBRID","FIRSTDETECT_EVER")] <- 0
+
+# define the FU_END date for both definitions
+df_surv <- df_surv %>% mutate(FU_END_check = case_when(LOSS == "Lost_EC_status" ~ LOSS_DATE,
+                                                       LOSS == "Kept_EC_status" & ART == 1 ~ ART_START,
+                                                       LOSS == "Kept_EC_status" & ART == 0 ~ LATEST_DATE),
+                              FU_END_DATE_HYBRID = case_when(LOSS_HYBRID == 1 ~ LOSS_HYBRID_DATE,
+                                                       LOSS_HYBRID == 0 & ART == 1 ~ ART_START,
+                                                       LOSS_HYBRID == 0 & ART == 0 ~ LATEST_DATE),)
+
+# double check if all FU_END dates are the same
+which(df_surv$FU_END_DATE != df_surv$FU_END_check)
+
+# with the new definition, the survival time FU_END has been changed in N=61 individuals
+#df_surv[which(df_surv$FU_END_DATE != df_surv$FU_END_DATE_HYBRID),c(1,6,7,8,9,29:33)] # to check the data
+
+# recalculate time FU_END for both definitions in days
+df_surv <- df_surv %>% mutate(FU_END2 = as.numeric((FU_END_DATE - T1_DATE)),
+                              FU_END_HYBRID = as.numeric((FU_END_DATE_HYBRID - T1_DATE)))
+
+# add FU_END_FULL for full history follow-up time
+df_surv <- df_surv %>% mutate(FU_END_FULL = as.numeric((FU_END_DATE - HIV_D)),
+                              FU_END_HYBRID_FULL = as.numeric((FU_END_DATE_HYBRID - HIV_D)))
+
+# double check if this is the same as before
+# df_surv[which(df_surv$FU_END != df_surv$FU_END2),c("SampleID","FU_END","FU_END2")]
+
+# double check the n=61 participants for whom the FU_END is different across definitions
+# df_surv[which(df_surv$FU_END_DATE != df_surv$FU_END_DATE_HYBRID),c("T1_DATE","FU_END_DATE", "FU_END", "FU_END_HYBRID", "FU_END_DATE_HYBRID")]
+
+# Add a log10 VL for T1
+df_surv$LOG10T1_VL <- df_surv$T1_VL
+df_surv <- df_surv %>% mutate(LOG10T1_VL = case_when(LOG10T1_VL <= 50 ~ log10(50),
+                                 LOG10T1_VL >50 ~ log10(LOG10T1_VL)))
+```
+
+## Estimate the loss-free follow-up with kaplan-meier
+
+```{r}
+library(survminer)
+library(survival)
+# create dataset with definition 1
+dfsurv1 <- df_surv %>% mutate(DEFINITION = "1",
+                             TIME = FU_END,
+                             STATUS = case_when(LOSS == "Kept_EC_status" ~ 0,
+                                                LOSS == "Lost_EC_status" ~ 1))
+# create dataset with definition 2
+dfsurv2 <- df_surv %>% mutate(DEFINITION = "2",
+                             TIME = FU_END_HYBRID,
+                             STATUS = case_when(LOSS_HYBRID == 0 ~ 0,
+                                                LOSS_HYBRID == 1 ~ 1))
+dfkm <- rbind(dfsurv1,dfsurv2)
+
+km1_fit <- survfit(Surv(dfkm[,"TIME"], dfkm[,"STATUS"]) ~ as.factor(dfkm[,"DEFINITION"]), data=dfkm) # use ~1 if you want to indicate there is no grouping variable.
+
+km1 <- ggsurvplot(km1_fit,censor.size=3, censor.shape=124,conf.int = T,
+           surv.scale = "percent", xlim = c(0,10*365.25), #ylim = c(0.75,1), 
+            break.y.by = 0.25, # y-axis tick marks
+            break.x.by = 365.25*2, # x-axis tick marks
+            xscale = "d_y", # transform labels from days to years
+            ylab = "Loss-free follow-up", font.y = c(10,"bold","black"),
+            xlab = "Time in years", font.x = c(10,"bold","black"),
+            font.tickslab = c(8,"plain","black"),
+            title = "", #"Follow-up without virological loss", font.title = c(10,"italic","black"),
+            legend = "none",
+            ggtheme = theme_bw(),
+            cumevents = TRUE, # table for cumulative events
+           fontsize = 2.5,
+           cumcensor = TRUE, # table for cumulative censoring
+                  risk.table = "abs_pct", # absolute with percentage
+                  tables.height = 0.25, # default is 0.25
+                  palette = c("#5ec962","darkorange"), # add multiple colors if more group levels
+                  #risk.table.fontsize =1.5, # redundant because of fontsize argument above
+                  tables.theme = clean_theme(),
+                  tables.y.text = F)
+km1
+km1.1 <- gridExtra::grid.arrange(km1$plot,
+                                 km1$table + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")),
+                                 km1$cumevents + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")), 
+                                 km1$ncensor.plot + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")),
+                               layout_matrix = cbind(c(1,1,1,1,1,1,2,2,3,3,4,4)))
+
+#ggsave(paste0(working_dir, "Outputs/LOSS_BOTHDEFINITIONS_KaplanMeier_Loss91_56_noLoss80_125_.pdf")
+#       ,km1.1, 
+#       scale = 1, width = 4, height =5, units = 'in', dpi = 300)
+
+
+# create dataset with definition 1 but now full follow-up
+dfsurv1.1 <- df_surv %>% mutate(DEFINITION = "1",
+                             TIME = FU_END_FULL,
+                             STATUS = case_when(LOSS == "Kept_EC_status" ~ 0,
+                                                LOSS == "Lost_EC_status" ~ 1))
+
+km1_fit <- survfit(Surv(dfsurv1.1[,"TIME"], dfsurv1.1[,"STATUS"]) ~ 1, data=dfsurv1.1) # use ~1 if you want to indicate there is no grouping variable.
+
+km1 <- ggsurvplot(km1_fit,censor.size=3, censor.shape=124,conf.int = T,
+           surv.scale = "percent", xlim = c(0,20*365.25), #ylim = c(0.75,1), 
+            break.y.by = 0.25, # y-axis tick marks
+            break.x.by = 365.25*5, # x-axis tick marks
+            xscale = "d_y", # transform labels from days to years
+            ylab = "Loss-free follow-up", font.y = c(10,"plain","black"),
+            xlab = "Time in years", font.x = c(10,"plain","black"),
+            font.tickslab = c(8,"plain","black"),
+            title = "", #"Follow-up without virological loss", font.title = c(10,"italic","black"),
+            legend = "none",
+            ggtheme = theme_bw(),
+            cumevents = TRUE, # table for cumulative events
+           fontsize = 2.5,
+           cumcensor = TRUE, # table for cumulative censoring
+                  risk.table = "abs_pct", # absolute with percentage
+                  tables.height = 0.25, # default is 0.25
+                  palette = c("#5ec962"), # add multiple colors if more group levels
+                  #risk.table.fontsize =1.5, # redundant because of fontsize argument above
+                  tables.theme = clean_theme(),
+                  tables.y.text = F)
+km1
+km1.1 <- gridExtra::grid.arrange(km1$plot,
+                                 km1$table + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")),
+                                 km1$cumevents + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")), 
+                                 km1$ncensor.plot + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")),
+                               layout_matrix = cbind(c(1,1,1,1,1,1,2,3,4)))
+
+ggsave(paste0(working_dir, "Outputs/Figure3B_LOSS_KaplanMeier_Loss56_noLoss125_.pdf")
+       ,km1.1, 
+       scale = 1, width = 4, height =4, units = 'in', dpi = 300)
+
+```
+
+### Cox regression, corrected for AGE, SEX, STORAGE_TIME, CENTER_EMC, CENTER_OLVG, CENTER_UMCU
+
+We will run cox regression for both definitions.
+
+Remember:
+
+Definition 1: reaching >10,000 copies/mL
+* Surv(FU_END, LOSS == "Lost_EC_status")
+
+Definition 2: reaching >10,000 copies/mL OR a >1000 copies/mL increase in the moving median.
+* Surv(FU_END_HYBRID, LOSS_HYBRID)
+
+```{r}
+summary.factor(df_surv$LOSS)
+summary.factor(df_surv$LOSS_HYBRID)
+table(df_surv$LOSS_HYBRID, df_surv$NONVIREMIC)
+```
+
+```{r}
+# Join with processed clinical data
+dfcox1 <- df_surv %>%
+  mutate(TIME = FU_END,
+         STATUS = case_when(LOSS == "Kept_EC_status" ~ 0,
+                            LOSS == "Lost_EC_status" ~ 1))
+dfcox2 <- df_surv %>%
+  mutate(TIME = FU_END_HYBRID,
+         STATUS = case_when(LOSS_HYBRID == 0 ~ 0,
+                            LOSS_HYBRID == 1 ~ 1))
+
+
+###### addendum 24-10-2024 to export prepared data as RDS object
+tempdir <- "C:/Users/accou/Downloads/" #"C:/Users/accou/Documents/PHD_2_projects/7_Predictionmodels_SHMOlink/Input/"
+
+saveRDS(df_surv, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_clinical_prepared.rds"))
+saveRDS(dfcox1, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_viralloss_prepared.rds"))
+saveRDS(dfcox2, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_hybriddefinition_prepared.rds"))
+rm(tempdir)
+######
+
+# double check the survival items: # this is the most important thing: TIME and STATUS must be coded correctly and the survival item must have the format of time (in this case in days) with an additional "+" sign if event happened (in this case, virological loss)
+Surv(dfcox1[,"TIME"],dfcox1[,"STATUS"])
+Surv(dfcox2[,"TIME"],dfcox2[,"STATUS"])
+
+# Run Cox regression definition 1
+olinkcolumns2 <- c(grep("GP2",colnames(dfcox1)):grep("NFU1",colnames(dfcox1)))
+res1 <- data.frame()
+for (i in olinkcolumns2) {
+    cox.res <- coxph(Surv(dfcox1[,"TIME"],dfcox1[,"STATUS"]) ~ dfcox1[,i] 
+                     + SEX + AGE + CENTER_EMC + CENTER_OLVG + CENTER_UMCU + STORAGE_TIME,
+                     data = dfcox1)
+    x <- summary(cox.res)
+    
+    newrow = 
+        cbind(
+        as.data.frame(colnames(dfcox1)[i], nm = "PROTEIN"), # protein name
+        as.data.frame(x$coef[1,"coef"],nm = "BETA"), # beta
+        as.data.frame(x$coef[1,"exp(coef)"],nm = "HR"), # Hazard ratio
+        as.data.frame(x$conf.int[1,"lower .95"],nm = "LOWER"),
+        as.data.frame(x$conf.int[1,"upper .95"],nm = "UPPER"), # 95% CI of the Hazard ratio
+        as.data.frame(x$coef[1,"Pr(>|z|)"], nm = "RAW_P") # P-value of coefficient
+        )
+    res1 <- rbind(res1,newrow)
+}
+res1$FDR_P <- p.adjust(res1$RAW_P, method = 'BH')
+res1[order(res1$FDR_P),]
+
+# Run Cox regression definition 2
+olinkcolumns2 <- c(grep("GP2",colnames(dfcox2)):grep("NFU1",colnames(dfcox2)))
+res2 <- data.frame()
+for (i in olinkcolumns2) {
+    cox.res <- coxph(Surv(dfcox2[,"TIME"],dfcox2[,"STATUS"]) ~ dfcox2[,i] 
+                     + SEX + AGE + CENTER_EMC + CENTER_OLVG + CENTER_UMCU + STORAGE_TIME,
+                     data = dfcox2)
+    x <- summary(cox.res)
+    
+    newrow = 
+        cbind(
+        as.data.frame(colnames(dfcox2)[i], nm = "PROTEIN"), # protein name
+        as.data.frame(x$coef[1,"coef"],nm = "BETA"), # beta
+        as.data.frame(x$coef[1,"exp(coef)"],nm = "HR"), # Hazard ratio
+        as.data.frame(x$conf.int[1,"lower .95"],nm = "LOWER"),
+        as.data.frame(x$conf.int[1,"upper .95"],nm = "UPPER"), # 95% CI of the Hazard ratio
+        as.data.frame(x$coef[1,"Pr(>|z|)"], nm = "RAW_P") # P-value of coefficient
+        )
+    res2 <- rbind(res2,newrow)
+}
+res2$FDR_P <- p.adjust(res2$RAW_P, method = 'BH')
+res2[order(res2$FDR_P),]
+```
+
+### Volcano plots
+
+```{r}
+library(ggrepel)
+head(res1)
+head(res2)
+
+# add a grouping column for coloring by significance; default value is "not significant"
+res1 <- res1 %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'RAW-P <0.05 but HR >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(res1)){
+  if(res1$FDR_P[i] < 0.05 | # 'FDR-P <0.05'
+     res1$FDR_P[i] < 0.1 | 
+     #(res1$RAW_P[i] < 0.001 & res1$HR[i] > 3) | # 'RAW-P <0.05 but HR >3'
+     #(res1$RAW_P[i] < 0.001 & res1$HR[i] <0.3) | # 'RAW-P <0.05 but HR <0.3'
+     (res1$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     ))
+  {res1$LABEL[i] <- res1$PROTEIN[i]} else
+  {res1$LABEL[i] <- ""}}
+res1
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+ggplot(res1, aes(x=HR, y=-log10(FDR_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("#5ec962","#440154","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=10, face="plain", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, color= "black", vjust=1),
+        axis.text.y=element_text(angle=0, size=8, color= "black", vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Hazard Ratio") +
+  ylab("-Log10 FDR P value") + 
+  scale_x_continuous(trans = 'log10', limits = c(0.15,5.5)) + 
+  ggtitle("Proteins associated with risk of virological loss (n=181)" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = NA, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 3, aes(label = LABEL,hjust = .5))+
+  ylim(0, 3) + # limits of the graph
+  geom_vline(xintercept=c(1), linetype="longdash", colour="black", linewidth=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", linewidth=0.4) #Add a horizontal line for P-value cut-off
+  
+ggsave(paste0(working_dir, "Outputs/Figure3C_LOSS_VIRLOSSCOX_Volcano_label_0.05FDRP_0.05RAWP2HR_agesexcenterstorage.pdf"), plot = last_plot(), device = NULL, path = NULL,scale = 1, width = 4, height =3.5, units = 'in', dpi = 300)
+
+####### and now for the second definition
+# add a grouping column for coloring by significance; default value is "not significant"
+res2 <- res2 %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'RAW-P <0.05 but HR >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(res2)){
+  if(res2$FDR_P[i] < 0.05 | # 'FDR-P <0.05'
+          res2$FDR_P[i] < 0.1 | 
+     #(res2$RAW_P[i] < 0.01 & res2$HR[i] > 3) | # 'RAW-P <0.05 but HR >3'
+     #(res2$RAW_P[i] < 0.01 & res2$HR[i] <0.3) | # 'RAW-P <0.05 but HR <0.3'
+     (res2$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     ))
+  {res2$LABEL[i] <- res2$PROTEIN[i]} else
+  {res2$LABEL[i] <- ""}}
+res2[order(res2$FDR_P),]
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+ggplot(res2, aes(x=HR, y=-log10(FDR_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("darkorange","#440154","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=10, face="plain", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, color= "black", vjust=1),
+        axis.text.y=element_text(angle=0, size=8, color= "black", vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Hazard Ratio") +
+  ylab("-Log10 FDR P value") + 
+  scale_x_continuous(trans = 'log10', limits = c(0.15,5.5)) + 
+  ggtitle("Proteins associated with risk of >1000 c/mL increase (n=181)" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = NA, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 3, aes(label = LABEL,hjust = .5))+
+  ylim(0, 3) + # limits of the graph
+  geom_vline(xintercept=c(1), linetype="longdash", colour="black", linewidth=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", linewidth=0.4) #Add a horizontal line for P-value cut-off
+  
+ggsave(paste0(working_dir, "Outputs/Figure3C_LOSS_VLINCREASECOX_Volcano_label_0.05FDRP_0.05RAWP2HR_agesexcenterstorage.pdf"), plot = last_plot(), device = NULL, path = NULL,scale = 1, width = 4, height =3.5, units = 'in', dpi = 300)
+
+# write results to excel file
+openxlsx::write.xlsx(res1,paste0(working_dir, "Outputs/Supplements_LOSS_Cox_VIRLOSS_125Kept_vs_56Lost_2420_agesexcenterstorage.xlsx")) 
+openxlsx::write.xlsx(res2,paste0(working_dir, "Outputs/Supplements_LOSS_Cox_VLINCREASE_90Kept_vs_91Lost_2420_agesexcenterstorage.xlsx"))
+
+###### addendum 24-10-2024 to export prepared data as RDS object
+tempdir <- "C:/Users/accou/Downloads/" #"C:/Users/accou/Documents/PHD_2_projects/7_Predictionmodels_SHMOlink/Input/"
+
+saveRDS(res1, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_viralloss_coxregr_sumstats.rds"))
+saveRDS(res2, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_hybriddefinition_coxregr_sumstats.rds"))
+rm(tempdir)
+######
+```
+
+
+## ADD CD4 DYNAMICS
+
+### Read cleaned data
+```{r}
+cd4_T1_500 <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_Longitudinal_Cd4Counts_Cleaned.rds"))
+```
+## Dot plot and line plot
+
+```{r}
+#Dot plot
+ggplot(data=cd4_T1_500,aes(x=YEARS_SINCE_T1_ROUNDED,y=sqrt(CD4A)))+
+  geom_hline(yintercept=sqrt(350), linetype="dashed", color = "black")+
+  geom_hline(yintercept=sqrt(500), linetype="dashed", color = "black")+
+    geom_hline(yintercept=sqrt(1000), linetype="dashed", color = "black")+
+  scale_color_manual(values=c("darkgrey","#b2182b")) +
+  #geom_line(stat = 'identity',aes(colour=SampleID,group=SampleID))+
+  theme_bw()+   theme(legend.position='none',
+                      plot.title = element_text(size = 12, color= "black", face = "bold"),
+                      axis.title = element_text(size = 10, color = "black"),
+                      axis.text = element_text(size = 8, color = "black")) +
+  geom_point(aes(colour=LOSS),size = 0.5)+ #LOSS
+  ylim(10,75) + xlim(0,20) +
+  labs(title = "CD4 T cell count measurements after T1")+
+  ylab("Square root CD4 T cell count")+    
+  xlab('Years since proteomics sample')+
+  geom_smooth(aes(colour = LOSS), method = "loess", se = TRUE) +
+  annotate("text", x=20, y=sqrt(275), label="350 cells/mm3", size = 3, color = "black") +
+  annotate("text", x=20, y=sqrt(400), label="500 cells/mm3", size = 3, color = "black") +
+  annotate("text", x=20, y=sqrt(850), label="1000 cells/mm3", size = 3, color = "black")
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS4D_IMMULOSS_Dotplot_LOESS_Loss42_noLoss96_CD4_time.pdf"),plot=last_plot(),
+       width = 4, height =3, units = 'in', dpi = 300)
+
+temp <- unique(cd4_T1_500[,c("SampleID","IMMU_LOSS_EVER")])
+summary(as.factor(temp$IMMU_LOSS_EVER))
+
+"#b2182b"
+```
+Make a gridarrange ggplot with duplicate plots, to get the same image proportions as with virological loss.
+```{r}
+cd4both <- ggplot(data=cd4_T1_500,aes(x=YEARS_SINCE_T1,y=sqrt(rollingmedian_index), group = SampleID))+
+ geom_hline(yintercept=sqrt(350), linetype="dashed", color = "black")+
+  geom_hline(yintercept=sqrt(500), linetype="dashed", color = "black")+
+  geom_hline(yintercept=sqrt(1000), linetype="dashed", color = "black")+
+  geom_line(aes(colour=IMMU_LOSS_EVER),alpha = 0.5,linewidth = 0.5)+ #LOSS_HYBRID
+  scale_color_manual(values=c("darkgrey","#b2182b")) +
+  theme_bw()+ theme(legend.position='none',
+        panel.grid.major.x = element_blank(),
+        axis.text = element_text(size = 8, color= "black"),
+        axis.title = element_text(size = 10, color= "black",face = "plain"),
+        plot.title = element_text(size = 10, color= "black"),
+        plot.subtitle = element_text(size = 10, color= "black", face = "italic"))+
+  labs(title = "CD4 moving median. Selection: only measurements after T1!", 
+       subtitle = "Definition: reaching CD4 <500 cells/mm3 after T1")+
+  labs(title = "CD4 T cell count measurements after T1")+
+  ylab("Square root moving median of CD4 T cell count")+    
+  xlab('Years since proteomics sample')+
+  ylim(10,75) + xlim(0,20) + 
+  annotate("text", x=20, y=sqrt(275), label="350 cells/mm3", size = 3, color = "black") +
+  annotate("text", x=20, y=sqrt(400), label="500 cells/mm3", size = 3, color = "black") +
+  annotate("text", x=20, y=sqrt(850), label="1000 cells/mm3", size = 3, color = "black")
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS4E_CD4_Lineplot_Loss42_noLoss96_sqrtCD4_afterT1_time.pdf")
+       , gridExtra::grid.arrange(cd4both, cd4both, ncol =1), 
+       scale = 1, width = 4, height =6, units = 'in', dpi = 300)
+
+```
+##### Define end of follow-up for immuloss <500
+
+Only in ECVC with CD4 > 500 at T1 (N=138).
+
+Also join VL increase definition.
+
+Define time and status for survival analyses.
+
+```{r}
+# add the other info
+df_surv3 <- left_join(unique(cd4_T1_500[,c("SampleID", "IMMU_LOSS_D","IMMU_LOSS_EVER")]), df, by = "SampleID")
+
+# define the FU_END time for immuloss <500
+df_surv3 <- df_surv3 %>% mutate(FU_END_DATE_IMMULOSS = case_when(IMMU_LOSS_EVER == 1 ~ IMMU_LOSS_D,
+                                                       IMMU_LOSS_EVER == 0 & ART == 1 ~ ART_START,
+                                                       IMMU_LOSS_EVER == 0 & ART == 0 ~ LATEST_DATE),
+                              FU_END_IMMULOSS = as.numeric((FU_END_DATE_IMMULOSS - T1_DATE)))
+
+# select the same IDs for VL increase
+df_surv4 <- df_surv[which(df_surv$SampleID %in% df_surv3$SampleID),]
+
+# define time and status for survival items
+df_surv3 <- df_surv3 %>% mutate(OUTCOME = "IMMULOSS",
+                                TIME = FU_END_IMMULOSS,
+                                STATUS = case_when(IMMU_LOSS_EVER == 0 ~ 0,
+                                                   IMMU_LOSS_EVER == 1 ~ 1))
+
+df_surv4 <- df_surv4  %>% mutate(OUTCOME = "VL_INCREASE",
+                             TIME = FU_END_HYBRID,
+                             STATUS = case_when(LOSS_HYBRID == 0 ~ 0,
+                                                LOSS_HYBRID == 1 ~ 1))
+
+# check survival items
+Surv(df_surv3[,"TIME"], df_surv3[,"STATUS"])
+Surv(df_surv4[,"TIME"], df_surv4[,"STATUS"])
+
+# join the two
+dfkm2 <- rbind(df_surv3[,c("SampleID","TIME","STATUS","OUTCOME")], df_surv4[,c("SampleID","TIME","STATUS","OUTCOME")])
+
+summary(as.factor(dfkm2$OUTCOME))
+
+## what is the overlap?
+temp <- left_join(df_surv3, df_surv4[,c("SampleID","LOSS_HYBRID","LOSS_HYBRID_DATE")], by = "SampleID")
+
+table(temp$LOSS_HYBRID, temp$IMMU_LOSS_EVER)
+
+summary(temp$IMMU_LOSS_EVER)
+
+both <- temp[which(temp$LOSS_HYBRID ==1 & temp$IMMU_LOSS_EVER ==1),c("IMMU_LOSS_D","LOSS_HYBRID_DATE","FU_END_DATE")]
+both <- both %>% mutate(relative = case_when(both$IMMU_LOSS_D < both$LOSS_HYBRID_DATE ~ "CD4 first",
+                                     both$IMMU_LOSS_D > both$LOSS_HYBRID_DATE ~ "VL first",
+                                     both$IMMU_LOSS_D == both$LOSS_HYBRID_DATE ~ "Simultaneous"))
+summary(as.factor(both$relative))
+```
+
+## Kaplan meier with CD4 decrease and VL increase
+
+```{r}
+# kaplan meier fit and plot
+km2_fit <- survfit(Surv(dfkm2[,"TIME"], dfkm2[,"STATUS"]) ~ OUTCOME, data=dfkm2) # use ~1 if you want to indicate there is no grouping variable.
+
+km2 <- ggsurvplot(km2_fit,censor.size=3, censor.shape=124,conf.int = T,
+           surv.scale = "percent", xlim = c(0,10*365.25), #ylim = c(0.75,1), 
+            break.y.by = 0.25, # y-axis tick marks
+            break.x.by = 365.25*2, # x-axis tick marks
+            xscale = "d_y", # transform labels from days to years
+            ylab = "Follow-up without loss", font.y = c(8,"plain","black"),
+            xlab = "Time in years", font.x = c(8,"plain","black"),
+            font.tickslab = c(8,"plain","black"),
+            title = "",
+            legend = "none",
+            ggtheme = theme_bw(),
+            cumevents = TRUE, # table for cumulative events
+           fontsize = 2.5,
+           cumcensor = TRUE, # table for cumulative censoring
+                  risk.table = "abs_pct", # absolute with percentage
+                  tables.height = 0.25, # default is 0.25
+                  palette = c("darkred","orange"), # add multiple colors if more group levels
+                  #risk.table.fontsize =1.5, # redundant because of fontsize argument above
+                  tables.theme = clean_theme(),
+                  tables.y.text = F)
+km2
+km2.1 <- gridExtra::grid.arrange(km2$plot,
+                                 km2$table + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")),
+                                 km2$cumevents + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")), 
+                                 km2$ncensor.plot + theme(plot.title = element_text(size = 8,face="plain"), panel.grid = element_line(colour="white")),
+                               layout_matrix = cbind(c(1,1,1,1,1,1,2,2,3,3,4,4)))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS4E_CD4_LOSS_CD4below500_KaplanMeier_Loss42_noLoss96_.pdf")
+       ,km2.1, 
+       scale = 1, width = 4, height =5, units = 'in', dpi = 300)
+```
+
+### Cox regression  CD4 < 500
+
+Power is reduced because we only have N=138 individuals
+
+```{r}
+# Join with processed clinical data
+dfcox5 <- df_surv3 # TIME AND STATUS DEFINED ABOVE
+
+###### addendum 24-10-2024 to export prepared data as RDS object
+tempdir <- "C:/Users/accou/Downloads/" #"C:/Users/accou/Documents/PHD_2_projects/7_Predictionmodels_SHMOlink/Input/"
+
+saveRDS(dfcox5, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_immunoloss_prepared.rds"))
+rm(tempdir)
+######
+
+
+# double check the survival items: # this is the most important thing: TIME and STATUS must be coded correctly and the survival item must have the format of time (in this case in days) with an additional "+" sign if censored
+Surv(dfcox5[,"TIME"],dfcox5[,"STATUS"])
+
+# Run Cox regression immu loss
+olinkcolumns2 <- c(grep("GP2",colnames(dfcox5)):grep("NFU1",colnames(dfcox5)))
+res3 <- data.frame()
+for (i in olinkcolumns2) {
+    cox.res <- coxph(Surv(dfcox5[,"TIME"],dfcox5[,"STATUS"]) ~ dfcox5[,i] 
+                     + SEX + AGE + CENTER_EMC + CENTER_OLVG + CENTER_UMCU + STORAGE_TIME,
+                     data = dfcox5)
+    x <- summary(cox.res)
+    
+    newrow = 
+        cbind(
+        as.data.frame(colnames(dfcox5)[i], nm = "PROTEIN"), # protein name
+        as.data.frame(x$coef[1,"coef"],nm = "BETA"), # beta
+        as.data.frame(x$coef[1,"exp(coef)"],nm = "HR"), # Hazard ratio
+        as.data.frame(x$conf.int[1,"lower .95"],nm = "LOWER"),
+        as.data.frame(x$conf.int[1,"upper .95"],nm = "UPPER"), # 95% CI of the Hazard ratio
+        as.data.frame(x$coef[1,"Pr(>|z|)"], nm = "RAW_P") # P-value of coefficient
+        )
+    res3 <- rbind(res3,newrow)
+}
+res3$FDR_P <- p.adjust(res3$RAW_P, method = 'BH')
+res3[order(res3$RAW_P),]
+
+###### addendum 24-10-2024 to export prepared data as RDS object
+tempdir <- "C:/Users/accou/Downloads/" #"C:/Users/accou/Documents/PHD_2_projects/7_Predictionmodels_SHMOlink/Input/"
+
+saveRDS(res3, file = paste0(tempdir, "OlinkATHENA_ARTnaiveECVC_immunoloss_coxregr_sumstats.rds"))
+rm(tempdir)
+######
+
+```
+## Volcano plot
+
+```{r}
+# add a grouping column for coloring by significance; default value is "not significant"
+res3 <- res3 %>% mutate(group= case_when(FDR_P < 0.05 ~ "FDR Significant",
+                                               RAW_P < 0.05 & FDR_P > 0.05 ~ "Nominal Significant",
+                                               RAW_P > 0.05 ~ "NotSignificant"
+                                               ))
+
+# add a text label if 'FDR-P <0.05', or if 'RAW-P <0.05 but HR >2', or if CRTAM, LY9, CD6, VAT1.
+for (i in 1:nrow(res3)){
+  if(res3$FDR_P[i] < 0.05 | # 'FDR-P <0.05'
+          res3$RAW_P[i] < 0.01 | 
+     #(res3$RAW_P[i] < 0.01 & res3$HR[i] > 3) | # 'RAW-P <0.05 but HR >3'
+     #(res3$RAW_P[i] < 0.01 & res3$HR[i] <0.3) | # 'RAW-P <0.05 but HR <0.3'
+     (res3$PROTEIN[i] %in% c("CRTAM","LY9","CD6","VAT1") # CRTAM, LY9, CD6, VAT1
+     ))
+  {res3$LABEL[i] <- res3$PROTEIN[i]} else
+  {res3$LABEL[i] <- ""}}
+res3[order(res3$FDR_P),]
+
+# make the volcano plot
+options(ggrepel.max.overlaps = Inf)
+ggplot(res3, aes(x=HR, y=-log10(RAW_P))) +
+  geom_point(aes(color=group), alpha=0.8, size=2) +
+  scale_color_manual(values=c("darkred","#4d4d4d")) + 
+  theme_bw() + # size of plotting window
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=10, face="plain", vjust=1),
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        axis.text.x=element_text(angle=0, size=8, color= "black", vjust=1),
+        axis.text.y=element_text(angle=0, size=8, color= "black", vjust=1),
+        axis.title=element_text(size=10),
+        legend.position = "none") +
+  # guides(colour = guide_legend(override.aes=list(size=2.5))) + #  Change the size of the icons/symbols in the legend
+  xlab("Hazard Ratio") +
+  ylab("-Log10 P value") + 
+  scale_x_continuous(trans = 'log10')+ #, limits = c(0.15,5.5)) + 
+  ggtitle("Proteins associated with risk of reaching CD4 < 500 (n=138)" ) +
+  geom_label_repel(  #Add the text labels 
+    label.size = NA, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 3, aes(label = LABEL,hjust = .5))+
+  #ylim(0, 3) + # limits of the graph
+  geom_vline(xintercept=c(1), linetype="longdash", colour="black", linewidth=0.4) + # Add a vertical line for Estimate change cut-offs
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", linewidth=0.4) #Add a horizontal line for P-value cut-off
+  
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS4F_CD4COX_Volcano_label_0.01RAWP_agesexcenterstorage.pdf"), plot = last_plot(), device = NULL, path = NULL,scale = 1, width = 4, height =3.5, units = 'in', dpi = 300)
+
+# write results to excel file
+openxlsx::write.xlsx(res3,paste0(working_dir, "Outputs/Supplements_LOSS_Cox_CD4LOSS_96Kept_42Lost_2420_agesexcenterstorage.xlsx")) 
+```
+## Specific forest plots Figure 3D
+
+Include all proteins that are FDR-significant for predicting virological loss OR VL increase >1000 c/mL.
+
+```{r}
+# select the proteins and join together
+virloss <- res1 %>% filter(PROTEIN %in% c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")) %>%
+  mutate(OUTCOME = "Virological Loss (viral load >10,000 copies/mL)")
+vlincrease <- res2 %>% filter(PROTEIN %in% c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3"))%>%
+  mutate(OUTCOME = ">1000 copies/mL increase in viral load")
+cd4less500 <- res3 %>% filter(PROTEIN %in% c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3"))%>%
+  mutate(OUTCOME = "Immunological Loss (CD4 < 500 cells/mm3)")
+
+forestall <- rbind(virloss, vlincrease, cd4less500)
+
+forestall$OUTCOME <- factor(forestall$OUTCOME, levels = unique(forestall$OUTCOME)[c(3,2,1)])
+forestall$PROTEIN <- factor(forestall$PROTEIN, levels = rev(c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")))
+
+# ALL
+ggplot(forestall, aes(x = HR, y = PROTEIN, color = OUTCOME)) +
+   geom_pointrange(aes(xmin = LOWER, xmax = UPPER, shape = OUTCOME),
+                   position = position_dodge(width = 0.5), size = 0.2, linewidth = 0.5) +
+   geom_vline(xintercept = 1, linetype = 2) +
+  theme_bw() + ylab("") + xlab("Hazard Ratio (95% CI)") +
+  theme(strip.placement = "outside",
+       strip.text= element_text(angle = 0, size = 6),
+       strip.background = element_blank(),
+       axis.title = element_text(size = 10, face = "plain",colour= "black"),
+       axis.text.y = element_text(size = 8, face = "plain",colour= "black"),
+       axis.text.x = element_text(size = 8, face= "plain",colour = "black"),
+       legend.position = "right",
+       plot.title = element_text(size = 10, face = "italic"),
+       panel.spacing = unit(0, "mm")) +
+  ggtitle("All elite and viremic controllers")+ 
+  scale_x_continuous(trans='log10')+#,limits = c(0.3,7))+
+  scale_color_manual(values = rev(c("#5ec962","orange","darkred")),name = "Predicted event") +
+  scale_shape_manual(values = c(17,15,16), name = "Predicted event")
+
+
+ggsave(paste0(working_dir, "Outputs/Figure3D_predict_CRTAMLY9CD6_91LOSS_90NOLOSS_FORESTPLOT.pdf"),
+       width = 5.5, height = 3.5, units = "in") # 1/8 A4 size
+```
+
+
+## Risk of detectable VL after T1 in 36 EC: Figure 3E
+
+**Sensitivity analysis with EC first detectable**
+
+I run cox regression for EC only.
+Next, I run cox regression again, but for the EC who are still VL <50 c/mL at T1.
+
+CRTAM and CD6 also significantly predict which EC will become detectable, but the 95%CI are very large. To limit the risk of overfitting I only correct for sex and age here.
+
+```{r}
+# define the FU_END date for both definitions
+dfsurvEC <- df_surv %>% filter(NONVIREMIC == 1) %>%
+  mutate(FU_END_ECDETECTDATE = case_when(FIRSTDETECT_EVER  == 1 ~ FIRSTDETECT_DATE,
+                                     FIRSTDETECT_EVER == 0 & ART == 1 ~ ART_START,
+                                     FIRSTDETECT_EVER == 0 & ART == 0 ~ LATEST_DATE)) %>%
+# recalculate time FU_END for both definitions in days
+  mutate(FU_END_ECDETECT = as.numeric(FU_END_ECDETECTDATE - T1_DATE)) %>%
+# if TIME == 0, set to 1, as is normally done in cox regressions
+  mutate(FU_END_ECDETECT = case_when(FU_END_ECDETECT != 0 ~ FU_END_ECDETECT,
+                                     FU_END_ECDETECT == 0 ~ 1))
+
+# join with olink data
+dfsurvEC <- dfsurvEC %>%
+  # define time and status for survival analysis
+  mutate(TIME = FU_END_ECDETECT,
+         STATUS = case_when(FIRSTDETECT_EVER == 0 ~ 0,
+                            FIRSTDETECT_EVER == 1 ~ 1))
+
+# check the survival item
+Surv(dfsurvEC[,"TIME"],dfsurvEC[,"STATUS"])
+
+# check the groups
+summary(as.factor(dfsurvEC$STATUS))
+summary(as.factor(dfsurvEC$FIRSTDETECT_EVER))
+
+# Check the main covariates
+table(dfsurvEC$CENTER,dfsurvEC$STATUS)
+table(dfsurvEC$SEX,dfsurvEC$STATUS)
+boxplot(dfsurvEC$AGE~dfsurvEC$STATUS)
+boxplot(dfsurvEC$STORAGE_TIME~dfsurvEC$STATUS)
+
+# Run cox regression for CRTAM, LY9 and CD6 and other FDR significant proteins in main analyses
+forestecdetect <- data.frame()
+for (protein in c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")){
+    cox.res <- coxph(Surv(dfsurvEC[,"TIME"],dfsurvEC[,"STATUS"]) ~ dfsurvEC[,protein]
+                     + SEX + AGE
+                     ,data = dfsurvEC)
+    x <- summary(cox.res)
+    
+    newrow = 
+        cbind(
+        as.data.frame(protein, nm = "PROTEIN"), # protein name
+        as.data.frame(x$coef[1,"coef"],nm = "BETA"), # beta
+        as.data.frame(x$coef[1,"exp(coef)"],nm = "HR"), # Hazard ratio
+        as.data.frame(x$conf.int[1,"lower .95"],nm = "LOWER"),
+        as.data.frame(x$conf.int[1,"upper .95"],nm = "UPPER"), # 95% CI of the Hazard ratio
+        as.data.frame(x$coef[1,"Pr(>|z|)"], nm = "RAW_P"), # P-value of coefficient
+        as.data.frame("All EC (n=36)", nm = "SELECTION")
+        )
+    forestecdetect <- rbind(forestecdetect,newrow) }
+forestecdetect
+
+# add cox results for filtered
+dfsurvEC2 <- dfsurvEC %>% filter(T1_VL == 0) 
+for (protein in c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")){
+    cox.res <- coxph(Surv(dfsurvEC2[,"TIME"],dfsurvEC2[,"STATUS"]) ~ dfsurvEC2[,protein]
+                     + SEX + AGE
+                     ,data = dfsurvEC2)
+    x <- summary(cox.res)
+    newrow = 
+        cbind(
+        as.data.frame(protein, nm = "PROTEIN"), # protein name
+        as.data.frame(x$coef[1,"coef"],nm = "BETA"), # beta
+        as.data.frame(x$coef[1,"exp(coef)"],nm = "HR"), # Hazard ratio
+        as.data.frame(x$conf.int[1,"lower .95"],nm = "LOWER"),
+        as.data.frame(x$conf.int[1,"upper .95"],nm = "UPPER"), # 95% CI of the Hazard ratio
+        as.data.frame(x$coef[1,"Pr(>|z|)"], nm = "RAW_P"), # P-value of coefficient
+        as.data.frame("EC <50 at sampling (n=30)", nm = "SELECTION")
+        )
+    forestecdetect <- rbind(forestecdetect,newrow) }
+forestecdetect
+
+forestecdetect$PROTEIN <- factor(forestecdetect$PROTEIN, levels = rev(c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")))
+
+forestecdetect %>% filter(PROTEIN %in% c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")) %>%
+   ggplot(aes(HR, PROTEIN, color = SELECTION)) +
+   geom_pointrange(aes(xmin = LOWER, xmax = UPPER),linewidth = 0.5, size = .2,
+                   position = position_dodge(width = 0.5)) +
+   geom_vline(xintercept = 1, linetype = 2) +
+  theme_bw() + ylab("") + xlab("Hazard Ratio (95% CI)") +
+  theme(strip.placement = "outside",
+       strip.text= element_text(angle = 0, size = 6),
+       strip.background = element_blank(),
+       axis.title = element_text(size = 10, face = "plain",colour= "black"),
+       axis.text.y = element_text(size = 8, face = "plain",colour= "black"),
+       axis.text.x = element_text(size = 8, face= "plain",colour = "black"),
+       legend.position = "none",
+       plot.title = element_text(size = 10, face = "italic"),
+       panel.spacing = unit(0, "mm")) +
+  ggtitle("Risk of detectable viral load in EC")+ 
+  scale_x_continuous(trans='log10') +
+  scale_color_manual(values = c("black","grey"),name="")
+
+ggsave(paste0(working_dir, "Outputs/Figure3E_LOSS_ECDETECTABLE_CRTAMLY9CD6ETC_15LOSS_21NOLOSS_FORESTPLOT.pdf"),
+       width = 3, height = 3.25, units = "in") # 1/8 A4 size
+
+# add the legend
+as_ggplot(get_legend(forestecdetect %>% filter(PROTEIN %in% c("ICAM3","CRTAM","LY9", "CD6","SH2D1A","C1QL2","CNGB3")) %>%
+   ggplot(aes(HR, PROTEIN, color = SELECTION)) +
+   geom_pointrange(aes(xmin = LOWER, xmax = UPPER),
+                   position = position_dodge(width = 0.5)) +
+  theme_bw() + ylab("") + xlab("Hazard Ratio (95% CI)") +
+  theme(strip.background = element_blank(),legend.position = "right")+
+  scale_color_manual(values = c("black","grey"),name="")))
+
+ggsave(paste0(working_dir, "Outputs/Figure3E_LEGEND.pdf"),
+       width = 2, height = 2, units = "in") # 1/8 A4 size
+
+# write results to excel file
+openxlsx::write.xlsx(forestecdetect,paste0(working_dir, "Outputs/Supplements_Figure3E_LOSSCOX_ECDETECTABLE_CRTAMLY9CD6ETC_15LOSS_21NOLOSS_agesex.xlsx")) 
+```
+

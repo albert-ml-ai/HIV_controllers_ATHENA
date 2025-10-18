@@ -1,0 +1,1092 @@
+---
+title: "Olink ananlysis eliteATHENA and 2000HIV"
+author: "Albert Groenendijk & Nadira Vadaq"
+date: "2022-11-22"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+---
+
+Updated July and December 2023 and January 2024 by Nadira.
+Major revisions, refactor and expansions by Albert, starting 9 February 2024, further additions October and December 2024.
+
+```{r echo=T, results='hide', warning=F,message=F}
+working_dir <- c("HIV_controllers_ATHENA/AthenaOlink_DifferentialExpression_CrossSectional/")
+
+library(FactoMineR)
+library(dplyr)
+library(magrittr)
+library(lubridate)
+library(table1)
+library(ggbiplot)
+library(ggplot2)
+library(openxlsx)
+```
+
+
+## Read Cleaned Data AthenaOlink
+
+```{r, warning=FALSE}
+master_df = readRDS(paste0(working_dir, "Inputs/AthenaOlink_EC_vs_VC_Cleaned.rds"))
+```
+
+**First, we inspect the distribution of covariates across groups, done in the cleaning script. Then we plot the impact of covariates on the data before and after correction.**
+
+**Based on these exploratory analyses we decide what to correct for in our analyses.**
+
+
+## Define functions for PCA, and PC vs covariate regression
+
+In the previous function `plot_PCA_regression()`, the FDR p values are reported for every regression model with FDR P < 0.05. The others are replaced by 0. This approach is not wrong but it diverges from what we agreed upon in the 2000HIV group with biostatisticians.
+
+Importantly, the P value may not be right measure to evaluate confounding influence: if the effect is large but so is the variance, then the P value will be high. If the effect is small but so is the variance, then the P value will be low. This is one of the main reasons why it was decided to report the regression coefficients and not the P values. Calculating estimate change also has disadvantage when the estimates are small: from 0.02 to 0.04 is a 200% change.
+
+Vicky (biostatistician) in email 30-6-2023:
+
+*As potential confounders, we choose those that show a strong correlation. In principle, a correlation coefficient of 0.10 is thought to represent a weak or small association; a correlation coefficient of .30 is considered a moderate association, and a correlation of .50 or larger is thought to represent a strong or large correlation. Attached I have an example of the correlation between confounders and the PCs when using the bulk transcriptomic data from ECs. For example, we see that there is a strong correlation  (0.55) between season cosine and PC1.*
+
+*Build your regression model (linear model or rank-based) using the potential confounders that you choose from step 3. Extract the residuals from your regression model which are the corrected values of cytokines for the confounders of choice. Let's say age, sex. In the rank-based regression R script, there is a block on how to extract the residuals; the output is a matrix with the sample ids and corrected values (residuals).*
+
+In our data, AGE, BMI, CENTER and STORAGE_TIME should be evaluated for EC vs VC. And for Transient_VC vs persistent_VC there are only mild differences: VL, CENTER, ETHNICITY_WHITE.
+
+```{r}
+plot_PCA_regression <- function(pca,
+                                meta_data,
+                                meta_variables,
+                                title = 'PC contribution',
+                                plotname) {
+  # Extract results
+  pca_res <- pca$ind$coord
+  # Select metadata to regress on
+  meta_data_filtered <- meta_data %>% select(all_of(meta_variables))
+  
+  # Extract percentage of variance explained for xlabs
+  pcnames <- paste0("PC", c(1:5), " (", round(pca$eig[c(1:5),"percentage of variance"],1), "%)")
+  
+  # Run linear regression model
+  for(i in colnames(meta_data_filtered)){
+    # Exclude metadata features with less than two unique variables
+    if(length(unique(meta_data_filtered[ ,i])) <2 ){
+      print(paste("exclude", i, sep = " "))
+    }
+  }
+  # Initiate output dataframe
+  pca_adj_r_sq <- matrix(data = NA, ncol = ncol(pca_res), nrow = ncol(meta_data_filtered)) %>%
+    set_colnames(colnames(pca_res)) %>%
+    set_rownames(colnames(meta_data_filtered))
+  # Loop over combinations of metadata and PCs and fill dataframe
+  for(i in 1:ncol(pca_res)){
+    for(j in 1:ncol(meta_data_filtered)){
+      pca_adj_r_sq[j,i] <- summary(lm(pca_res[,i] ~ meta_data_filtered[,j], na.action = na.exclude))$adj.r.squared
+    }
+  }
+  
+  colnames(pca_adj_r_sq) <- pcnames
+  
+  # Define color scheme
+  paletteLength<-50
+  my_palette <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+  # Calculate most extreme rsq (either positive or negative)
+  rsq_max <- max(abs(min(pca_adj_r_sq)), max(pca_adj_r_sq))
+  breakList <- seq(-0.5, 0.5, by = (1/paletteLength))
+  #breakList <- seq(-rsq_max, rsq_max, by = (2*rsq_max/paletteLength))
+  # breakList <- c(seq(-rsq_max, 0, length.out = ceiling(paletteLength/2) + 1), 
+  #                seq(max(pca_adj_r_sq)/paletteLength, max(pca_adj_r_sq), length.out = floor(paletteLength/2)))
+  # Plot heatmap
+  
+  hm <- pheatmap::pheatmap(as.matrix(pca_adj_r_sq),
+                           cluster_rows = F,
+                           cluster_cols = F,
+                           show_rownames = T,
+                           show_colnames = T,
+                           scale = "none",
+                           main = title,
+                           display_numbers = T,
+                           color= my_palette,
+                           breaks = breakList)
+  
+  # to save pheatmap, use function. 
+  ### Source: https://stackoverflow.com/questions/43051525/how-to-draw-pheatmap-plot-to-screen-and-also-save-to-file
+  save_pheatmap_pdf <- function(x, filename, width=4, height=5) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(paste0(working_dir,"Outputs/",filename), width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+  }
+  
+save_pheatmap_pdf(hm, plotname)
+}
+
+```
+
+## Perform PCA and plot PCs uncorrected against covariates
+
+Missing metadata for CD4 (N = 2) and BMI (N = 31) were imputed with the median for the evaluation of covariates.
+
+Missing metadata for categorical variables (smoking, ethnicity) were included as separate factor level called "UNKNOWN".
+
+Note that this is ONLY for evaluation of covariates. For the main analysis, individuals with missing information are excluded from the analysis.
+
+```{r}
+library(FactoMineR)
+library(missMDA) # to impute PCA with the mean, in case of missing values, as advised by FactoMineR documentation
+
+# select metadata with covariates
+metadata <- master_df[,c("AGE", "SEX", "T1_BMI", "BMI_CAT", "ETHNICITY",
+                         "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                         "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                         "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                         "SMOKING_EVER", "SMOKING_CURRENT", 
+                         "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                         "T1_DATE", "STORAGE_TIME", "HIV_DUR", 
+                         "VL", "LOG10VL", "CD4", "CD4NADIR", "SQRTCD4", "SQRTCD4NADIR")]
+
+# evaluate missingness in metadata:
+colSums(is.na(metadata))
+
+# impute the two missing CD4 with the median CD4 count
+metadata[which(is.na(metadata$CD4)),"CD4"] <- median(metadata$CD4,na.rm = T)
+metadata[which(is.na(metadata$SQRTCD4)),"SQRTCD4"] <- median(metadata$SQRTCD4,na.rm = T)
+
+# impute the 31 missing T1_BMI with the median BMI
+metadata[which(is.na(metadata$T1_BMI)),"T1_BMI"] <- median(metadata$T1_BMI,na.rm = T)
+
+# add a factor level "unknown" for BMI_CAT, ETHNICITY, ETHNICITY_WHITE, ETHNICITY_BLACK, SMOKING_EVER and SMOKING_CURRENT
+for (var in c("BMI_CAT", "ETHNICITY", "ETHNICITY_WHITE", "ETHNICITY_BLACK", "SMOKING_EVER", "SMOKING_CURRENT")) {
+  metadata[,var] <- factor(metadata[,var], levels = c(levels(metadata[,var]),"UNKNOWN"))
+  metadata[which(is.na(metadata[,var])),var] <- "UNKNOWN"
+}
+
+# now there are no more missing data
+colSums(is.na(metadata))
+
+# select npx protein expression data
+npx <- master_df[,grep("Cardiometabolic|Inflammation|Neurology|Oncology", colnames(master_df))]
+
+# check there are no duplicated columns (sum of all True/False treats True as 1 and False as 0)
+sum(duplicated(colnames(metadata),colnames(npx)))
+
+# impute unknown npx values with missMDA::imputePCA(), as advised in the FactoMineR documentation
+res.comp <- imputePCA(npx,ncp=5)
+PCA_before_correction <- PCA(res.comp, scale.unit = T, graph = F)
+
+# plot the PCA before correction
+plot_PCA_regression(PCA_before_correction,
+                    meta_data = metadata,
+                    meta_variables = c("AGE","SEX", "T1_BMI", "BMI_CAT", "ETHNICITY",
+                                       "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                                       "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                                       "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                                       "SMOKING_EVER", "SMOKING_CURRENT", 
+                                       "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                                       "STORAGE_TIME", "HIV_DUR"
+                                       #,"VL","LOG10VL","CD4", "CD4NADIR", "SQRTCD4", "SQRTCD4NADIR"
+                                       ),
+                    plotname = "Supplements_PCA_regression_uncorrected.pdf"
+                    )
+
+```
+
+### Interpretation covariates and confounding
+
+The following variables could have an influence and should be evaluated:
+* ETHNICITY, especially ETHNICITY_WHITE
+* AGE
+* SEX
+* CENTER, specifically CENTER_EMC and CENTER_OLVG
+
+The effect of other variables is minimal.
+
+Note: Since ETHNICITY is missing in N=23 individuals, we will not be able to correct for ETHNICITY in the whole group of the main analysis.
+
+In our data, AGE, BMI, CENTER and STORAGE_TIME should be evaluated for EC vs VC.
+* For BMI, a sensitivity stratification with boxplots will suffice, as Nadira already did before
+* STORAGE_TIME is worth correcting for, either as main model or as sensitivity
+* AGE is worth correcting for.
+* ETHNICITY and CENTER should be explored in terms of confounding
+
+And for Transient_VC vs persistent_VC there are only mild differences at baseline: VL, CENTER, ETHNICITY_WHITE.
+* ETHNICITY_WHITE and CENTER_EMC and CENTER_OLVG should be explored in terms of confounding
+* beware that CENTER_EMC and CENTER_OLVG are also directly related to the outcome: much more Transient_VC in these centers. Therefore, stratification across groups may be required.
+* a sensitivity with VL is a good idea, although the effect is expected to be minimal
+
+
+### Limma regression and extract the residuals
+```{r}
+library(limma)
+
+head(metadata) # contains all metadata
+head(npx) # contains all protein expression data
+
+# create function to provide PCAregression after inserting the design matrix, and plot title.
+f <- function(design_cov,ti) {
+# if there are NA in any of the covariates, the error will be: row dimension of design doesn't match column dimension of data object
+# in this case, people with NA values should be removed, which we have done above for clinical columns using na.omit
+
+# Generate the protein expression matrix 
+eset <- as.matrix(t(npx))  # Transpose data
+dim(eset)
+# [1] 2420  183
+
+#Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data, which the NPX values already are
+
+# Limma residuals matrix
+ResidualsMatrix <- residuals(fit1_cov, eset)
+# View(ResidualsMatrix)
+
+dim(ResidualsMatrix)
+#[1] 2420  183
+
+# turn residuals into a data.frame in same order as metadata
+Residualsdf <- data.frame(t(ResidualsMatrix))
+sum(rownames(metadata) == rownames(Residualsdf)) # this should be same as the total no. of individuals
+
+# Rerun PCA after correction
+res.comp <- imputePCA(Residualsdf,ncp=5)
+PCA_after_correction <-  PCA(res.comp,
+                            graph = FALSE, scale.unit = TRUE)
+
+# plot the PCs against selected covariates
+plot_PCA_regression(PCA_after_correction,
+                    meta_data = metadata,
+                    meta_variables = c("AGE","SEX", "T1_BMI", "BMI_CAT", "ETHNICITY",
+                                       "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                                       "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                                       "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                                       "SMOKING_EVER", "SMOKING_CURRENT", 
+                                       "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                                       "STORAGE_TIME", "HIV_DUR" 
+                                       #,"VL","LOG10VL","CD4", "CD4NADIR", "SQRTCD4", "SQRTCD4NADIR"
+                                       ),
+                    plotname = ti)
+}
+
+
+
+# See how corrections influence the data
+design_AGE_SEX <- model.matrix(~AGE + SEX, data = master_df)
+design_AGE_SEX_CENTEREMC <- model.matrix(~AGE + SEX + CENTER_EMC, data = master_df)
+design_AGE_SEX_CENTEROLVG <- model.matrix(~AGE + SEX + CENTER_OLVG, data = master_df)
+design_AGE_SEX_CENTER <- model.matrix(~AGE + SEX + CENTER, data = master_df)
+design_AGE_SEX_CENTEREMC_STORAGETIME <- model.matrix(~AGE + SEX + CENTER_EMC + STORAGE_TIME, data = master_df)
+design_AGE_SEX_ETHNICITYWHITE <- model.matrix(~AGE + SEX + ETHNICITY_WHITE, data = metadata) ## ethnicity requires metadata which has category "unknown"
+design_AGE_SEX_CENTEREMC_ETHNICITYWHITE <- model.matrix(~AGE + SEX + CENTER_EMC + ETHNICITY_WHITE, data = metadata) ## ethnicity requires metadata which has category "unknown"
+design_AGE_SEX_CENTEREMC_ETHNICITYWHITE_STORAGETIME <- model.matrix(~AGE + SEX + CENTER_EMC + ETHNICITY_WHITE + STORAGE_TIME, data = metadata) ## ethnicity requires metadata which has category "unknown"
+
+# Running the functions
+f(design_AGE_SEX,"Supplements_PCA_regression_AGE_SEX.pdf")
+f(design_AGE_SEX_CENTEREMC,"Supplements_PCA_regression_AGE_SEX_CENTEREMC.pdf" )
+f(design_AGE_SEX_CENTEROLVG,"Supplements_PCA_regression_AGE_SEX_CENTEROLVG.pdf" )
+f(design_AGE_SEX_CENTER, "Supplements_PCA_regression_AGE_SEX_CENTER.pdf")
+f(design_AGE_SEX_CENTEREMC_STORAGETIME, "Supplements_PCA_regression_AGE_SEX_CENTER_STORAGETIME.pdf")
+f(design_AGE_SEX_ETHNICITYWHITE,"Supplements_PCA_regression_AGE_SEX_ETHNICITYWHITE.pdf")
+f(design_AGE_SEX_CENTEREMC_ETHNICITYWHITE,"Supplements_PCA_regression_AGE_SEX_CENTEREMC_ETHNICITYWHITE.pdf" )
+f(design_AGE_SEX_CENTEREMC_ETHNICITYWHITE_STORAGETIME,"Supplements_PCA_regression_AGE_SEX_CENTEREMC_ETHNICITYWHITE.pdf" )
+
+# Nadira's model
+design_AGE_SEX_CENTER_STORAGETIME <- model.matrix(~AGE + SEX + CENTER + STORAGE_TIME, data = master_df)
+f(design_AGE_SEX_CENTER_STORAGETIME, "Supplements_PCA_regression_AGE_SEX_CENTER_STORAGETIME.pdf")
+
+# Nadira's model for prediction of loss
+design_AGE_SEX_CENTEREMCOLVGUMCU_STORAGETIME <- model.matrix(~AGE + SEX + CENTER_EMC + CENTER_OLVG + CENTER_UMCU + STORAGE_TIME, data = master_df)
+f(design_AGE_SEX_CENTEREMCOLVGUMCU_STORAGETIME, "Supplements_PCA_regression_AGE_SEX_CENTEREMCOLVGUMCU_STORAGETIME.pdf")
+
+```
+### Explore if CENTER_EMC effect might be explained by EC vs VC or VCtransient vs VCpersistent
+
+Do CENTER effects (especially CENTER_EMC) remain if we subset the data to VCpersistent (largest subgroup) or VCtransient?
+
+```{r}
+# the VCpersistent and VCtransient info was added to master_df during Cleaning script
+master_df <- readRDS(paste0(working_dir, "Inputs/AthenaOlink_EC_vs_VC_Cleaned.rds"))
+
+# identify rownumbers of VCpersistent and VCtransient
+rnum_vc_persistent <- which(master_df$LOSS == "Persistent_VC")
+rnum_vc_transient <- which(master_df$LOSS == "Transient_VC")
+
+### run uncorrected PC regression for Persistent_VC
+# subset the metadata and npx protein expression data
+metadata_sub <- metadata[rnum_vc_persistent,]
+npx_sub <- npx[rnum_vc_persistent,]
+
+# verify rownumbers are the same
+metadata_sub$T1_DATE == master_df[which(master_df$LOSS == "Persistent_VC"),"T1_DATE"] 
+
+# impute unknown npx values with missMDA::imputePCA(), as advised in the FactoMineR documentation
+res.comp <- imputePCA(npx_sub,ncp=5)
+PCA_before_correction <- PCA(res.comp, scale.unit = T, graph = F)
+
+# plot the PCA before correction
+plot_PCA_regression(PCA_before_correction,
+                    meta_data = metadata_sub,
+                    meta_variables = c("AGE","SEX", "T1_BMI", "BMI_CAT", "ETHNICITY",
+                                       "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                                       "CENTER", "CENTER_EMC","CENTER_LUMC", "CENTER_MSZ",
+                                       "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                                       "SMOKING_EVER", "SMOKING_CURRENT", 
+                                       "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                                       "T1_DATE", "STORAGE_TIME", "HIV_DUR", 
+                                       "VL","LOG10VL","CD4", "CD4NADIR", "SQRTCD4", "SQRTCD4NADIR"),
+                    plotname = "Supplements_PCA_regression_uncorrected_ONLY_VCpersistent.pdf"
+                    )
+
+### run uncorrected PC regression for Transient_VC
+# subset the metadata and npx protein expression data
+metadata_sub <- metadata[rnum_vc_transient,]
+npx_sub <- npx[rnum_vc_transient,]
+
+# verify rownumbers are the same
+metadata_sub$T1_DATE == master_df[which(master_df$LOSS == "Transient_VC"),"T1_DATE"] 
+
+# impute unknown npx values with missMDA::imputePCA(), as advised in the FactoMineR documentation
+res.comp <- imputePCA(npx_sub,ncp=5)
+PCA_before_correction <- PCA(res.comp, scale.unit = T, graph = F)
+
+# plot the PCA before correction
+plot_PCA_regression(PCA_before_correction,
+                    meta_data = metadata_sub,
+                    meta_variables = c("AGE","SEX", "T1_BMI", "BMI_CAT", "ETHNICITY",
+                                       "ETHNICITY_WHITE", "ETHNICITY_BLACK",
+                                       "CENTER", "CENTER_EMC","CENTER_LUMC", # "CENTER_MSZ", # CENTER MSZ does not have transient VC
+                                       "CENTER_OLVG", "CENTER_RAD", "CENTER_UMCU",
+                                       "SMOKING_EVER", "SMOKING_CURRENT", 
+                                       "SEASON_COS","SEASON_SIN", "SEASON_CAT",
+                                       "T1_DATE", "STORAGE_TIME", "HIV_DUR", 
+                                       "VL","LOG10VL","CD4", "CD4NADIR", "SQRTCD4", "SQRTCD4NADIR"),
+                    plotname = "Supplements_PCA_regression_uncorrected_ONLY_VCtransient.pdf"
+                    )
+```
+Interpretation: 
+
+Stratifying persistent_VC and transient_VC seems to attenuate the CENTER effect, but it is still visible for transient_VC. Consistent with the whole group, CENTER_EMC seems to be the one standing out. I (Albert) know of no specific explanation for this, other than that I was not the one to aliquot the EMC samples, which was done locally, whereas all other centers were aliquotted by me. Fortunately, the effect is very mild with coefficients <0.10. This means that it is safe to include EMC samples as long as we correct for CENTER_EMC.
+
+## Run linear regression EC vs VC in eliteATHENA (discovery)
+We corrected previously for AGE, SEX, CENTER (all) and STORAGE_TIME. CENTER (all) creates 5 dummy variables. Since the total sample size is 183, there is little risk of overfitting.
+
+Correction for AGE, SEX, CENTER and STORAGE_TIME can be defended. Correction for CENTER_EMC seems already sufficient in the PC regression.
+
+Because ETHNICITY was similar between EC and VC, we do only a sensitivity analysis with ETHNICITY_WHITE.
+
+```{r}
+# select npx protein expression data
+npx <- master_df[,grep("Cardiometabolic|Inflammation|Neurology|Oncology", colnames(master_df))]
+
+# Generate the protein expression matrix 
+eset <- as.matrix(t(npx))  # Transpose data
+dim(eset)
+# [1] 2420  183
+
+# Design matrix
+design_cov <- model.matrix(~ NONVIREMIC + AGE + SEX + CENTER + STORAGE_TIME, data = master_df)
+
+# Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data. Note: the NPX values already are log-transformed.
+cont.matrix_cov <- makeContrasts(NONVIREMICVC,
+                                 levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov,cont.matrix_cov) 
+fit2_cov <- eBayes(fit2_cov)
+
+# You can verify that the covariates for EC, VC and Early_ART are the same before and after adding contrasts.
+#head(fit1_cov$coefficients)
+#head(fit2_cov$coefficients)
+
+# Note that sometimes a warning is generated because `(Intercept)` was renamed to `Intercept` 
+### That is also why another warning is generated: "Warning: row names of contrasts don't match col names of coefficients"
+#colnames(fit1_cov$coefficients)
+#rownames(cont.matrix_cov)
+
+# Display "N" number of differentially expressed proteins
+DEP_cov <- topTable(fit2_cov, coef = "NONVIREMICVC", adjust = "BH", number = 2421) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$adj.P.Val<0.05,]
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+summary(results_cov)
+
+# double check group assignment and interpretation
+boxplot(master_df$CRTAM_Neurology~master_df$NONVIREMIC)
+
+help(sort)
+#Save the file
+mod2_save <- DEP_cov %>%
+  mutate(Try= gsub("_II","2",Outcome)) %>%
+  tidyr::extract(Try, into = c("Outcome", "Panel"), "(.*)_([^_]+)$")  %>%
+  mutate(Panel = gsub("2","_II",Panel))
+mod2_save <- mod2_save[,c(7,1:6,8)]
+openxlsx::write.xlsx(mod2_save,paste0(working_dir, "Outputs/Supplements_LIMMA_Olink_SHM_Comparison1_147ARTnaiveVC_vs_36EC_2420Prots_AGE_SEX_CENTER.xlsx"))
+
+```
+
+### Sensitivity analyses correcting for CENTER_EMC, CENTER_OLVG and/or CENTER_MSZ only
+```{r}
+##########################
+### Sensitivity analyses I
+limma_ECVC_sensitivity <- function(design_cov) {
+# This function uses the eset as defined above
+# Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data. Note: the NPX values already are log-transformed.
+cont.matrix_cov <- makeContrasts(NONVIREMICVC,
+                                 levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov,cont.matrix_cov) 
+fit2_cov <- eBayes(fit2_cov)
+# Display "N" number of differentially expressed proteins
+DEP_cov <- topTable(fit2_cov, coef = "NONVIREMICVC", adjust = "BH", number = 2421) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$adj.P.Val<0.05,]
+print(rownames(DEP_cov_sig))
+results_cov <- decideTests(fit2_cov)
+return(summary(results_cov))
+}
+
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER_EMC + STORAGE_TIME, data = master_df)))
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER_OLVG + STORAGE_TIME, data = master_df)))
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER_EMC + CENTER_MSZ + STORAGE_TIME, data = master_df)))
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER + STORAGE_TIME, data = master_df)))
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER, data = master_df)))
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER + STORAGE_TIME, data = master_df)))
+
+# part 3 model
+suppressWarnings(limma_ECVC_sensitivity(model.matrix(~ NONVIREMIC + AGE + SEX + CENTER_EMC + CENTER_OLVG + CENTER_UMCU + STORAGE_TIME, data = master_df))) 
+
+# report how many are in each center by group
+summary(master_df$CENTER)
+for (var in c("CENTER_EMC", "CENTER_OLVG", "CENTER_UMCU","CENTER_MSZ", "CENTER_LUMC", "CENTER_RAD")) {
+  print(var)
+  print(summary(master_df[,var]))
+}
+summary(master_df$NONVIREMIC)
+```
+Interpretation: the results are very consistent: CRTAM, LY9 and CD6 are always significantly upregulated.
+
+STORAGE_TIME does alter the number of significant proteins and should be included.
+
+### Sensitivity analysis with ETHNICITY
+PC regression shows that correction for ETHNICITY_WHITE is sufficient.
+
+A sensitivity analysis with ETHNICITY_WHITE:
+1. Everyone with ETHNICITY == NA, is regarded as ETHNICITY_WHITE == 0.
+2. Exclude individuals with ETHNICITY == NA.
+
+The results with the first way are exactly the same. With the second way, statistical power is less, and only 2 DEPs are detected, instead of 4. The raw P values are <0.01, though with consistent direction.
+
+This validates the main findings.
+
+```{r}
+### 1. Everyone with ETHNICITY == NA, is regarded as ETHNICITY_WHITE == 0.
+df_ethnicity1 <- master_df
+df_ethnicity1$ETHNICITY_WHITE[which(is.na(df_ethnicity1$ETHNICITY_WHITE))] <- 0
+summary(df_ethnicity1$ETHNICITY_WHITE)
+
+# We keep all participants so the protein expression matrix is the same
+eset <- as.matrix(t(npx))  # Transpose data
+design_cov <- model.matrix(~ NONVIREMIC + AGE + SEX + CENTER + STORAGE_TIME + ETHNICITY_WHITE, data = df_ethnicity1)
+# Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data. Note: the NPX values already are log-transformed.
+cont.matrix_cov <- makeContrasts(NONVIREMICVC,
+                                 levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov,cont.matrix_cov) 
+fit2_cov <- eBayes(fit2_cov)
+# Display "N" number of differentially expressed proteins
+DEP_cov <- topTable(fit2_cov, coef = "NONVIREMICVC", adjust = "BH", number = 2421) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$adj.P.Val<0.05,]
+print(rownames(DEP_cov_sig))
+results_cov <- decideTests(fit2_cov)
+summary(results_cov)
+
+### 2. Exclude individuals with ETHNICITY == NA
+exclude_rnum <- which(is.na(master_df$ETHNICITY))
+eset2 <- as.matrix(t(npx[-exclude_rnum,]))
+dim(eset2)
+design_cov <- model.matrix(~ NONVIREMIC + AGE + SEX + CENTER + STORAGE_TIME + ETHNICITY_WHITE, data = master_df[-exclude_rnum,])
+dim(design_cov)
+# Fitting model
+fit1_cov <- lmFit(eset2, design_cov) # limma assumes log-transformed data. Note: the NPX values already are log-transformed.
+cont.matrix_cov <- makeContrasts(NONVIREMICVC,
+                                 levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov,cont.matrix_cov) 
+fit2_cov <- eBayes(fit2_cov)
+# Display "N" number of differentially expressed proteins
+DEP_cov <- topTable(fit2_cov, coef = "NONVIREMICVC", adjust = "BH", number = 2421) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$adj.P.Val<0.05,]
+print(rownames(DEP_cov_sig))
+results_cov <- decideTests(fit2_cov)
+summary(results_cov)
+```
+### Sensitivity analysis: Run linear regression by log10(VL) 
+
+Since EC and VC are distinguished by their viral loads, we should expect to see very similar findings with a linear predictor log10(viral load). 
+
+To be consistent, I correct for the same confounders.
+```{r}
+dim(eset)
+design_cov <- model.matrix(~ LOG10VL + AGE + SEX + CENTER + STORAGE_TIME, data = master_df)
+# Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data. Note: the NPX values already are log-transformed.
+
+cont.matrix_cov <- makeContrasts(LOG10VL = -1,
+                                 levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov,cont.matrix_cov) 
+fit2_cov <- eBayes(fit2_cov)
+# Display "N" number of differentially expressed proteins
+DEP_cov <- topTable(fit2_cov, coef = "LOG10VL", adjust = "BH", number = 2421) %>%
+  mutate(Outcome = rownames(.))
+DEP_cov_sig <- DEP_cov[DEP_cov$adj.P.Val<0.05,]
+print(rownames(DEP_cov_sig))
+results_cov <- decideTests(fit2_cov)
+summary(results_cov)
+
+mod2_save <- DEP_cov %>%
+  mutate(Try= gsub("_II","2",Outcome)) %>%
+  tidyr::extract(Try, into = c("Outcome", "Panel"), "(.*)_([^_]+)$")  %>%
+  mutate(Panel = gsub("2","_II",Panel))
+mod2_save <- mod2_save[,c(7,1:6,8)]
+openxlsx::write.xlsx(mod2_save,paste0(working_dir, "Outputs/Supplements_LIMMA_Olink_LOG10VL_2420Prots_AGE_SEX_CENTER_STORAGETIME.xlsx"))
+
+
+DEP_cov[grep("CRTAM_|LY9_|CD6_I|VAT1_",rownames(DEP_cov)),]
+
+plot(master_df$CRTAM_Neurology~master_df$LOG10VL)
+cor.test(master_df$CRTAM_Neurology,master_df$LOG10VL, method="spearman")[c("p.value","estimate")]
+cor.test(master_df$LY9_Inflammation,master_df$LOG10VL, method="spearman")[c("p.value","estimate")]
+cor.test(master_df$CD6_Inflammation,master_df$LOG10VL, method="spearman")[c("p.value","estimate")]
+cor.test(master_df$VAT1_Oncology,master_df$LOG10VL, method="spearman")[c("p.value","estimate")]
+```
+
+### Plot the EC vs VC FC against the LOG10VL FC
+Define the colorgroup for P values as well.
+
+```{r}
+ECVC <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LIMMA_Olink_SHM_Comparison1_147ARTnaiveVC_vs_36EC_2420Prots_AGE_SEX_CENTER.xlsx"))
+colnames(ECVC) <- paste0(colnames(ECVC),"_ECVC")
+colnames(ECVC)[1] <- "Outcome"
+
+VL <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LIMMA_Olink_LOG10VL_2420Prots_AGE_SEX_CENTER_STORAGETIME.xlsx"))
+colnames(VL) <- paste0(colnames(VL),"_LOG10VL")
+colnames(VL)[1] <- "Outcome"
+
+corrdata <- left_join(ECVC,VL,by="Outcome")
+corrdata <- corrdata %>% mutate(COLORGROUP = case_when(adj.P.Val_ECVC < 0.05 & adj.P.Val_LOG10VL <0.05 ~ "FDR <0.05 in both",
+                                                       adj.P.Val_ECVC > 0.05 & adj.P.Val_LOG10VL <0.05 ~ "FDR <0.05 in log10(VL)",
+                                                       adj.P.Val_ECVC < 0.05 & adj.P.Val_LOG10VL >0.05 ~ "FDR <0.05 in VC vs. EC.",
+                                                       adj.P.Val_ECVC > 0.05 & adj.P.Val_LOG10VL >0.05 ~ "Not significant"))
+corrdata$COLORGROUP <- as.factor(corrdata$COLORGROUP) 
+
+corrdata <- corrdata %>% mutate(PROTEINLABEL = case_when(adj.P.Val_ECVC < 0.05 ~ Outcome,
+                                                         adj.P.Val_ECVC > 0.05 ~ "" ))
+
+PROTEINLABEL_OUTSIDE <- corrdata$PROTEINLABEL
+
+# Create a scatter plot with a correlation line
+options(ggrepel.max.overlaps = Inf)
+ggplot(data = corrdata, aes(x = logFC_ECVC, y = logFC_LOG10VL, color = COLORGROUP)) +
+  geom_point(aes(size = COLORGROUP)) +  # Add the dot plot
+  #geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add the correlation line
+  geom_vline(xintercept = 0) + geom_hline(yintercept = 0) +
+  scale_color_manual(values = c("#b2182b","darkgreen","darkblue","#4d4d4d"), name = "") + 
+  scale_size_manual(values = c(2, 0.75, 2, 0.75), name = "") +
+  ylab("Log2 fold change for 1 unit change in log10(viral load)") + 
+  xlab("Log2 fold change for VC vs. EC (reference)") + 
+  theme_bw() + #geom_label(corrdata$PROTEINLABEL)
+  ggrepel::geom_label_repel(
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.1, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 2,
+    aes(
+      label = PROTEINLABEL_OUTSIDE,
+      hjust = .5), color = "black")
+
+```
+
+### Figure 1B - volcano discovery
+```{r}
+#### GG PLOT VOLCANO #####
+library(ggplot2)
+library("ggrepel")
+
+result2 <- openxlsx::read.xlsx(paste0(working_dir, "Outputs/Supplements_LIMMA_Olink_SHM_Comparison1_147ARTnaiveVC_vs_36EC_2420Prots_AGE_SEX_CENTER.xlsx"))
+diff_df <- result2[,c(1,6,2)]
+colnames(diff_df) <- c("Proteins", "pValue","Estimate")
+
+# add a grouping column; default value is "not significant"
+diff_df["group"] <- "NotSignificant"
+
+# change the grouping for the entries with significance but not a large enough OR change
+diff_df[which(diff_df['pValue'] < 0.05 ),"group"] <- "Significant"
+
+diff_df$group <- as.factor(diff_df$group)
+diff_df$Proteins <- as.character(diff_df$Proteins)
+rownames(diff_df) <- diff_df$Proteins
+
+diff_df_names <- diff_df
+for (i in 1:nrow(diff_df_names))
+  if(diff_df_names$pValue[i] < 0.05)#0.0000001; 5e-20
+  {diff_df_names$Proteins[i] <- diff_df_names$Proteins[i]} else
+  {diff_df_names$Proteins[i] <- ""}
+
+options(ggrepel.max.overlaps = Inf)
+ggplot(diff_df_names, aes(x=Estimate, y=-log10(pValue))) +
+  
+  #Add points:
+  #   Colour based on factors set a few lines up
+  #   'alpha' provides gradual shading of colour
+  #   Set size of points
+  geom_point(aes(color=group, alpha=0.8, size=0.8), show.legend = FALSE) +
+  
+  #Choose which colours to use; otherwise, ggplot2 choose automatically (order depends on how factors are ordered in diff_df$group)
+  scale_color_manual(values=c("#4d4d4d","#b2182b")) + 
+  
+  #Set the size of the plotting window
+  theme_bw(base_size=14) +
+  
+  #Modify various aspects of the plot text and legend
+  theme(legend.background=element_rect(),
+        plot.title=element_text(angle=0, size=20, face="bold", vjust=1),
+        
+        panel.grid.major=element_blank(), #Remove gridlines
+        panel.grid.minor=element_blank(), #Remove gridlines
+        
+        axis.text.x=element_text(angle=0, size=15, vjust=1),
+        axis.text.y=element_text(angle=0, size=15, vjust=1),
+        axis.title=element_text(size=15),
+        
+        #Legend
+        # legend.position="top",        #Moves the legend to the top of the plot
+        # legend.key=element_blank(),       #removes the border
+        # legend.key.size=unit(0.5, "cm"),  #Sets overall area/size of the legend
+        # legend.text=element_text(size=8), #Text size
+        # title=element_text(size=8),       #Title text size
+        # legend.title=element_blank()) +   #Remove the title
+        legend.position = "none")+
+  
+  #Change the size of the icons/symbols in the legend
+  guides(colour = guide_legend(override.aes=list(size=2.5))) +
+  
+  #Set x- and y-axes labels
+  xlab(bquote(~Log[2]~"Fold Change NPX")) +
+  ylab(bquote(~-Log[10]~"FDR pValue ")) +
+  
+  #Set title
+  ggtitle("149 ART-naive VC vs. 36 EC proteins differences" ) +
+  
+  #Add the text labels for a Proteins
+  geom_label_repel(
+    label.size = .25, #Size of label border, in mm.
+    box.padding = unit(0.45, "lines"),
+    label.padding = 0.25, # Amount of padding around label, as unit or number.
+    label.r = 0.15, #Radius of rounded corners,
+    size = 8,
+    aes(
+      label = Proteins,
+      hjust = .5))+
+  
+  #Add a vertical line for Estimate change cut-offs
+  geom_vline(xintercept=c(0), linetype="longdash", colour="black", linewidth=0.4) +
+  
+  #Add a horizontal line for P-value cut-off
+  geom_hline(yintercept=-log10(0.05), linetype="longdash", colour="black", linewidth=0.4)+ 
+  xlim(c(-2.5,2)) + ylim(c(0,2))
+
+#Boxplot(merge_df$RBP7_Oncology_II~as.factor(merge_df$NONVIREMIC))
+
+ggsave(paste0(working_dir, "Outputs/Figure1B_Volcano_label_0.05FDR_LIMMA_Olink_147VC_vs_36EC_2420Prots_AGE_SEX_CENTER_STORAGE.pdf"), plot = last_plot(), device = NULL, path = NULL,scale = 1, width = 15, height =12, units = 'in', dpi = 300)
+```
+
+### Figures - boxplots CRTAM, LY9 CD6 and VAT1
+#### prepare data
+```{r}
+library("reshape2")
+
+# Prepare the data
+cocktails_df <- master_df %>%
+  dplyr::select( "ID", "NONVIREMIC","SMOKING_CURRENT","T1_BMI","VL",
+                 "CRTAM_Neurology","LY9_Inflammation","CD6_Inflammation","VAT1_Oncology") %>%
+  mutate(BMI_cat2 = case_when(T1_BMI <18.5 ~ "BMI <18.5",
+                             T1_BMI >=18.5 & T1_BMI <24.9 ~ "BMI 18.5-24.9",
+                             T1_BMI >=25 ~ "BMI >=25"),
+         SMOKING_CURRENT = ifelse(SMOKING_CURRENT==0,"Smoking (+)","Smoking (-)"))%>%
+  dplyr::mutate(VL_cat = case_when( NONVIREMIC=="EC" ~ "EC",
+                            NONVIREMIC=="VC" & VL < 400 ~ "50-400",
+                            NONVIREMIC=="VC" & VL >= 400 & VL < 2000 ~ "400-2000",
+                            NONVIREMIC=="VC" & VL > 2000 ~ "2000-10000")) #choose cell populations of interest
+
+# pivot longer with melt() from reshape2
+melt_data <- reshape2::melt(cocktails_df, id=c("ID", "NONVIREMIC","SMOKING_CURRENT","T1_BMI","BMI_cat2","VL","VL_cat")) 
+summary(as.factor(melt_data$variable))
+# extract protein and panel names from variable name
+melt_data <- melt_data %>%
+  mutate(Protein = stringr::str_split_i(variable,"_",1),
+         Panel = stringr::str_split_i(variable,"_",2))
+
+# make factors in the right order
+melt_data$VL_cat <- factor(melt_data$VL_cat, levels = c("EC","50-400","400-2000","2000-10000"))
+melt_data$Protein <- factor(melt_data$Protein, levels = c("CRTAM","LY9","CD6","VAT1"))
+melt_data$BMI_cat <- factor(melt_data$BMI_cat, levels = c("BMI <18.5","BMI 18.5-24.9","BMI >=25"))
+
+# double check whether the data has been correctly transformed
+head(melt_data)
+summary(as.factor(melt_data$Protein))
+str(melt_data)
+```
+#### Figure 1C Violin plots Discovery EC vs VC
+```{r}
+# Figure 1C Violin plots Discovery EC vs VC
+summary(melt_data$NONVIREMIC) # no NAs
+
+g<-  ggplot(melt_data, aes(x = NONVIREMIC, y = value, fill = NONVIREMIC))+
+  geom_violin(alpha=0.3, position = position_dodge(width = .9), linewidth=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_dodge2(width = 0.75), 
+               aes(color = NONVIREMIC),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3", "darkgrey"))+
+  scale_color_manual(values=c("red3", "darkgrey"))+
+  theme(legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank())
+
+ggsave(paste0(working_dir, "Outputs/Figure1C_Boxplot_ECVC_CRTAMLY9CD6VAT1.pdf"),g, dpi = 300,width = 7, height = 7, units = "cm" ) 
+
+g2 <- g + theme(legend.position = "right")
+ggsave(paste0(working_dir, "Outputs/Figure1C_Boxplot_ECVC_CRTAMLY9CD6VAT1_legend.pdf"),ggpubr::as_ggplot(ggpubr::get_legend(g2)), dpi = 300,width = 7, height = 7, units = "cm" ) 
+
+# P values with wilcoxon/mannwhitney
+combis <- combn(levels(melt_data$VL_cat),2) # all combinations
+combinames <- paste(combis[1,],"vs", combis[2,]) # as string
+pvalues <- data.frame(combi = combinames, group1 = combis[1,], group2 = combis[2,], pvalue = NA) # add the groups for each combi
+pvalues <- merge(pvalues, levels(melt_data$Protein)) # for every protein
+
+# determine P values
+for (i in c(1:nrow(pvalues))) {
+pval <- wilcox.test(melt_data[which(melt_data$Protein == pvalues[i,"y"] & 
+                                    melt_data$VL_cat == pvalues[i,"group1"]),"value"], # values in group1
+                    melt_data[which(melt_data$Protein == pvalues[i,"y"] & 
+                                    melt_data$VL_cat == pvalues[i,"group2"]),"value"])$p.value # values in group2
+pvalues[i,"pvalue"] <- pval
+}
+pvalues
+```
+#### Figure 1E Boxplots by VL category
+```{r}
+# Figure 1E Boxplots by VL category
+summary(melt_data$VL_cat) # no NAs
+
+melt_data %>% 
+  ggplot(aes(x = VL_cat, y = value, fill = VL_cat))+
+  #geom_violin(alpha=0.3, position = position_dodge(width = .9), size=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_jitterdodge(dodge.width = .9), 
+               aes(color = VL_cat),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c("")) +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3","#1B9E77","#7570B3","darkgrey"))+ # green and purple from dark2 RColorBrewer::brewer.pal(8, "Dark2")
+  scale_color_manual(values=c("red3","#1B9E77","#7570B3","darkgrey"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8, angle = 45, hjust = 1))
+
+ggsave(paste0(working_dir, "Outputs/Figure1E_Boxplot_147ARTnaiveVC_vs_36EC_2421Prots_AGE_SEX_CENTER_STORAGE_STRATIFIED_VL.pdf"), dpi = 300,width = 10, height = 10, units = "cm" ) 
+ 
+
+```
+#### Supplementary boxplots, stratification by potential additional confounders
+```{r}
+### Figure S2A - SMOKING stratification
+melt_data$SMOKING_CURRENT <- as.factor(melt_data$SMOKING_CURRENT)
+
+melt_data %>% 
+  #filter(!is.na(T1_BMI))%>%
+  filter(!is.na(SMOKING_CURRENT))%>%
+  ggplot(aes(x = SMOKING_CURRENT, y = value, fill = NONVIREMIC))+
+  #geom_violin(alpha=0.3, position = position_dodge(width = .9), size=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_jitterdodge(dodge.width = .9), 
+               aes(color = NONVIREMIC),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3","darkgrey"))+
+  scale_color_manual(values=c( "red3","darkgrey"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8, angle = 45, hjust = 1))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS2A_Boxplot_Stratified_SMOKINGCURRENT.pdf"), dpi = 300,width = 10, height = 10, units = "cm" ) 
+
+# print P values
+for(protein in levels(melt_data$Protein)) {
+  for(stratum in levels(melt_data$SMOKING_CURRENT)) {
+  pval <- wilcox.test(melt_data[which(melt_data$Protein == protein &
+                                melt_data$SMOKING_CURRENT == stratum),"value"] ~ # by EC/VC status
+              melt_data[which(melt_data$Protein == protein &
+                                melt_data$SMOKING_CURRENT == stratum),"NONVIREMIC"])$p.value
+  print(paste(protein, stratum, pval))
+}}
+
+# Before, the P values were switched between smoking+ and smoking-
+# double check the loop above with CRTAM and Smoking (-)
+wilcox.test(melt_data[which(melt_data$Protein == "CRTAM" &
+                                melt_data$SMOKING_CURRENT == "Smoking (-)"),"value"] ~ # by EC/VC status
+              melt_data[which(melt_data$Protein == "CRTAM" &
+                                melt_data$SMOKING_CURRENT == "Smoking (-)"),"NONVIREMIC"])
+# double check the loop above with CRTAM and Smoking (+)
+wilcox.test(melt_data[which(melt_data$Protein == "CRTAM" &
+                                melt_data$SMOKING_CURRENT == "Smoking (+)"),"value"] ~ # by EC/VC status
+              melt_data[which(melt_data$Protein == "CRTAM" &
+                                melt_data$SMOKING_CURRENT == "Smoking (+)"),"NONVIREMIC"])
+
+### Figure S2B - BMI stratification
+melt_data$BMI_cat2 <- factor(melt_data$BMI_cat2, levels = unique(melt_data$BMI_cat2)[c(4,1,2)])
+
+melt_data %>% 
+  filter(!is.na(BMI_cat2))%>%
+  ggplot(aes(x = BMI_cat2, y = value, fill = NONVIREMIC))+
+  #geom_violin(alpha=0.3, position = position_dodge(width = .9), size=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_jitterdodge(dodge.width = .9), 
+               aes(color = NONVIREMIC),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3","darkgrey"))+
+  scale_color_manual(values=c( "red3","darkgrey"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8, angle = 45, hjust = 1))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS2B_Boxplot_Stratified_BMIcategory.pdf"), dpi = 300,width = 10, height = 10, units = "cm" ) 
+
+# P values
+for(protein in levels(melt_data$Protein)) {
+  for(stratum in levels(melt_data$BMI_cat2)) {
+  pval <- wilcox.test(melt_data[which(melt_data$Protein == protein &
+                                melt_data$BMI_cat2 == stratum),"value"] ~ # by EC/VC status
+              melt_data[which(melt_data$Protein == protein &
+                                melt_data$BMI_cat2 == stratum),"NONVIREMIC"])$p.value
+  print(paste(protein, stratum, pval))
+}}
+
+### Figure S2C - ETHNICITY stratification
+# add ethnicity_white
+melt_data <- left_join(melt_data, master_df[c("ID","ETHNICITY_WHITE")], by = "ID")
+melt_data$ETHNICITY_WHITE <- factor(melt_data$ETHNICITY_WHITE, levels = c(1,0), labels = c("White ethnicity", "Other ethnicity"))
+summary(melt_data$ETHNICITY_WHITE)
+
+melt_data %>% 
+  filter(!is.na(ETHNICITY_WHITE))%>%
+  ggplot(aes(x = ETHNICITY_WHITE, y = value, fill = NONVIREMIC))+
+  #geom_violin(alpha=0.3, position = position_dodge(width = .9), size=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_jitterdodge(dodge.width = .9), 
+               aes(color = NONVIREMIC),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3","darkgrey"))+
+  scale_color_manual(values=c( "red3","darkgrey"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8, angle = 45, hjust = 1))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS2C_Boxplot_Stratified_ETHNICITYWHITE.pdf"), dpi = 300,width = 10, height = 10, units = "cm" ) 
+
+# P values
+for(protein in levels(melt_data$Protein)) {
+  for(stratum in levels(melt_data$ETHNICITY_WHITE)) {
+  pval <- wilcox.test(melt_data[which(melt_data$Protein == protein &
+                                melt_data$ETHNICITY_WHITE == stratum),"value"] ~ # by EC/VC status
+              melt_data[which(melt_data$Protein == protein &
+                                melt_data$ETHNICITY_WHITE == stratum),"NONVIREMIC"])$p.value
+  print(paste(protein, stratum, pval))
+}}
+```
+### Figure S2D - PC plot by plasma viral load
+
+Since we identify the need for correcting our data, it is more meaningful to plot the PC1 and PC2 of the residuals, since the point of the figure is to show whethere there are differences by plasma VL category.
+
+```{r}
+# extract residuals after correcting for AGE, SEX, CENTER and STORAGE_TIME with LIMMA
+npx <- master_df[,grep("Cardiometabolic|Inflammation|Neurology|Oncology", colnames(master_df))]
+
+# Generate the protein expression matrix 
+eset <- as.matrix(t(npx))  # Transpose data
+dim(eset) # [1] 2420  183
+# Design matrix
+design_cov <- model.matrix(~ NONVIREMIC + AGE + SEX + CENTER + STORAGE_TIME, data = master_df)
+#Fitting model
+fit1_cov <- lmFit(eset, design_cov) # limma assumes log-transformed data, which the NPX values already are
+# Limma residuals matrix
+ResidualsMatrix <- residuals(fit1_cov, eset)
+
+# store residuals in new dataframe for S2D
+npx_s2d <- data.frame(t(ResidualsMatrix))
+sum(rownames(master_df) == rownames(npx_s2d))
+prin_comp <- prcomp(npx_s2d, center = T,scale. = T) # In Nadira's script, it was  `scale. = False`, although in the PC regressions and in Vicky's example script, we set scale.unit in PCA() always to True. Here I also set `scale. = T`.
+summary(prin_comp)$importance[2,c(1:5)]
+
+# Create VL category again
+master_df <- master_df %>% 
+  mutate(VL_cat = case_when(VL <50 ~ "<50",
+                            VL >= 50 & VL < 400 ~ "50-400",
+                            VL >= 400 & VL < 2000 ~ "400-2000",
+                            VL > 2000 ~ "2000-10000"))
+master_df$VL_cat <- factor(master_df$VL_cat, levels = c("<50","50-400","400-2000","2000-10000"))
+summary(master_df$VL_cat)
+
+# PCA Plot
+ ggbiplot(prin_comp, obs.scale = 1, var.scale = 1,
+              #labels = rownames(prin_comp$x),
+              groups = as.factor(master_df$VL_cat),
+              circle = F, ellipse = T, var.axes = F,
+              alpha = 0.5,ellipse.fill = "none",ellipse.linewidth = 0.5)+
+  #geom_point(shape=as.factor(df_m_1$NONVIREMIC),
+  #           aes(colour=as.factor(master_df$VL_cat)),
+  #           alpha = .5,
+  #           size=1.5)+
+  scale_color_manual(values = c("red3","#1B9E77","#7570B3","darkgrey"),name = "Viral load at sampling") +
+  theme(legend.direction = 'horizontal',
+        legend.position = 'top')+
+  theme_bw(base_size=10)+
+  labs(title ="N = 183") + ylim(-60,60) + xlim(-80,80)
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS2D_PCAresiduals_plot_vlcutoff_183samp_2420proteins.pdf"), dpi = 300, width = 11.25, height = 10, units = "cm" )
+```
+
+### Figure S2E - corrplots with viral load
+```{r}
+melt_data$LOG10VL <- melt_data$VL
+melt_data[which(melt_data$VL == 0),"LOG10VL"] <- 50
+melt_data$LOG10VL <- log10(melt_data$LOG10VL)
+
+melt_data %>%
+  ggplot(aes(x = LOG10VL, y = value, color = NONVIREMIC)) +
+  geom_point(alpha = 0.5, aes(size = NONVIREMIC)) + 
+  geom_smooth(method = "lm", se = FALSE) +
+  xlab("Plasma viral load at sampling") +
+  ylab("Log2 NPX") +
+  facet_wrap(~Protein, scales = "free",ncol = 4)+
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3","darkgrey"))+
+  scale_color_manual(values=c( "red3","darkgrey"))+
+  scale_size_manual(values=c(1,0.75)) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8, angle = 45, hjust = 1))
+
+ggsave(paste0(working_dir, "Outputs/Supplements_FigureS2E_Protein~VL_183samp_2420proteins.pdf"), dpi = 300, width = 19, height = 5, units = "cm" )
+
+```
+
+## ART-naive EC and VC in 2000HIV (validation cohort)
+
+Read data 2000HIV and prepare data.
+
+```{r}
+merge_df <- readRDS(paste0(working_dir, "Inputs/Validation2000HIVOlink_EC_vs_VC_Cleaned.rds")) %>% tidyr::drop_na(AGE, SEX_BIRTH, CENTER )
+summary(merge_df$EC_combined)
+# ARTnaive_VC          EC
+#           5          14
+
+merge_df$EC_combined <- relevel(merge_df$EC_combined,"EC")
+```
+### Compare ART-naive EC to ART-naive VC with wilcoxon/mannwhitney
+
+We compare 5 VC vs 14 EC
+```{r}
+# calculate P values
+wilcox.test(merge_df$CRTAM_Neurology~merge_df$EC_combined)#p-value = 0.007224
+summary(lm(merge_df$CRTAM_Neurology~merge_df$EC_combined+merge_df$AGE+merge_df$SEX_BIRTH))#p-value = 0.005552
+
+wilcox.test(merge_df$LY9_Inflammation~merge_df$EC_combined)#p-value = 0.05573
+summary(lm(merge_df$LY9_Inflammation~merge_df$EC_combined+merge_df$AGE+merge_df$SEX_BIRTH))#p-value = 0.0435
+
+wilcox.test(merge_df$CD6_Inflammation~merge_df$EC_combined)#0.01032
+summary(lm(merge_df$CD6_Inflammation~merge_df$EC_combined+merge_df$AGE+merge_df$SEX_BIRTH))#p-value = 0.00589
+
+wilcox.test(merge_df$VAT1_Oncology~merge_df$EC_combined)#0.04369
+summary(lm(merge_df$VAT1_Oncology~merge_df$EC_combined+merge_df$AGE+merge_df$SEX_BIRTH))#p-value = 0.042
+
+### Prepare data for boxplots
+cocktails_df <- merge_df %>% 
+  dplyr::select("EC_combined",
+                 "CRTAM_Neurology","LY9_Inflammation","CD6_Inflammation","VAT1_Oncology") #choose cell populations of interest
+
+# pivot longer with melt() from reshape2
+melt_data <- melt(cocktails_df)
+melt_data <- melt_data %>%
+  mutate(Protein = stringr::str_split_i(variable,"_",1),
+         Panel = stringr::str_split_i(variable,"_",2))
+melt_data$Protein <- factor(melt_data$Protein, levels = c("CRTAM","LY9","CD6","VAT1"))
+
+# double check whether the data has been correctly transformed
+head(melt_data)
+table(melt_data$EC_combined, melt_data$Protein)
+```
+#### Figure 1D Violin plots Validation EC vs VC
+```{r}
+# Figure 1D Violin plots Discovery EC vs VC
+g<-  ggplot(melt_data, aes(x = EC_combined, y = value, fill = EC_combined))+
+  geom_violin(alpha=0.3, position = position_dodge(width = .9), linewidth=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_dodge2(width = 0.75), 
+               aes(color = EC_combined),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3", "darkgrey"))+
+  scale_color_manual(values=c("red3", "darkgrey"))+
+  theme(legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank())
+
+ggsave(paste0(working_dir, "Outputs/Figure1D_Boxplot_ECVC_VALIDATION_CRTAMLY9CD6VAT1.pdf"),g, dpi = 300,width = 7, height = 7, units = "cm" ) 
+
+g2 <- g + theme(legend.position = "right")
+ggsave(paste0(working_dir, "Outputs/Figure1D_Boxplot_ECVC_VALIDATION_CRTAMLY9CD6VAT1_legend.pdf"),ggpubr::as_ggplot(ggpubr::get_legend(g2)), dpi = 300,width = 7, height = 7, units = "cm" ) 
+```
+

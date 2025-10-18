@@ -1,0 +1,210 @@
+---
+title: "Olink ananlysis eliteATHENA and 2000HIV"
+author: "Albert Groenendijk & Nadira Vadaq"
+date: "2022-11-22"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+---
+
+The third reviewer asked about the possibility that differencees are only present for HIV controllers with higher BMI >25. This is an in-depth analysis of the role of BMI in our data.
+
+```{r echo=T, results='hide', warning=F,message=F}
+working_dir <- c("HIV_controllers_ATHENA/AthenaOlink_DifferentialExpression_CrossSectional/")
+
+library(FactoMineR)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(lubridate)
+library(table1)
+library(ggbiplot)
+library(ggplot2)
+library(gridExtra)
+library(openxlsx)
+```
+
+
+## Read Cleaned Data AthenaOlink
+
+```{r, warning=FALSE}
+master_df = readRDS(paste0(working_dir, "Inputs/AthenaOlink_EC_vs_VC_Cleaned.rds"))
+```
+
+## Visualize BMI distribution
+```{r}
+summary(master_df$T1_BMI)
+summary(master_df$BMI_CAT)
+
+master_df %>%
+  group_by(NONVIREMIC) %>%
+  summarize(
+    missing_count = sum(is.na(T1_BMI)),
+    nonmissing_count = sum(!is.na(T1_BMI)),
+    total = n(),
+    percentage_missing = round((missing_count / total) * 100,2)
+  )
+
+ggplot(master_df, aes(x = T1_BMI, color = NONVIREMIC)) +
+  geom_density(linewidth= 2) +
+  labs(
+    title = "Density Distribution of BMI by NONVIREMIC Status",
+    x = "BMI",
+    y = "Density",
+    color = "NONVIREMIC"
+  ) +
+  theme_minimal()
+```
+
+## counts of BMI CAT2 per stratum
+```{r}
+cocktails_df <- master_df %>%
+  dplyr::select( "ID", "NONVIREMIC","SMOKING_CURRENT","T1_BMI","VL",
+                 "CRTAM_Neurology","LY9_Inflammation","CD6_Inflammation","VAT1_Oncology") %>%
+  mutate(BMI_cat2 = case_when(T1_BMI <18.5 ~ "BMI <18.5 (N)",
+                             T1_BMI >=18.5 & T1_BMI <25 ~ "BMI 18.5-24.9 (N)",
+                             T1_BMI >=25 ~ "BMI >=25 (N)"))
+
+cocktails_df %>%
+  filter(!is.na(BMI_cat2)) %>%   # exclude missing BMI categories
+  count(NONVIREMIC, BMI_cat2) %>%
+  pivot_wider(names_from = BMI_cat2, values_from = n, values_fill = 0) %>%
+  select(NONVIREMIC, `BMI <18.5 (N)`, `BMI 18.5-24.9 (N)`, `BMI >=25 (N)`) %>%
+  rename(Group = NONVIREMIC)
+```
+## Correlate BMI with VL/AGE/CRTAM/LY9/CD6/VAT1
+```{r}
+df_corr <- master_df %>%
+  select(
+    ID = COMP_1_2_ID,
+    BMI = T1_BMI,
+    VL = VL,
+    AGE = AGE,
+    CRTAM = CRTAM_Neurology,
+    LY9 = LY9_Inflammation,
+    CD6 = CD6_Inflammation,
+    VAT1 = VAT1_Oncology,
+    ECVC = NONVIREMIC
+  ) %>% filter(!is.na(BMI))
+
+y_cols <- c("VL", "AGE", "CRTAM", "LY9","CD6", "VAT1")
+
+plots <- list()
+for (y_col in y_cols) {
+  # Get correlation test results between BMI and y_col
+  corr_test <- cor.test(df_corr$BMI, df_corr[[y_col]], use = "complete.obs", method='spearman')
+  r_val <- round(corr_test$estimate, 2)
+  p_val <- signif(corr_test$p.value, 2)
+  
+  # Create subtitle with correlation and missing BMI count info
+  subtitle_text <- paste0("rho = ", r_val, ", p = ", p_val)
+                          
+  
+  # Plot with ggplot
+  p <- ggplot(df_corr, aes(x = .data$BMI, y = .data[[y_col]])) +
+    geom_point(alpha = 0.6, size=0.5) +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    labs(
+      title = paste("BMI against", y_col),
+      subtitle = subtitle_text,
+      x = "BMI (kg/m²)",
+      y = y_col
+    ) +
+    theme_minimal()
+  
+  plots[[y_col]] <- p
+  
+}
+# Arrange plots in 3 columns and 2 rows
+combined_plot <- grid.arrange(grobs = plots, ncol = 3, nrow = 2)
+
+# Save to PDF: dimensions of A4 size in inches ~ 8.27 x 11.69
+# Set width = 8.27 (A4 width), height = 11.69 / 3 ~ 3.9 (one third A4 height)
+ggsave(paste0(working_dir, "Outputs/AdditionalRebuttal_BMICorrelations.pdf"), combined_plot, dpi=300, width = 8.27, height = 5, units = "in")
+```
+#### prepare data
+```{r}
+library("reshape2")
+
+# Prepare the data
+cocktails_df <- master_df %>%
+  dplyr::select( "ID", "NONVIREMIC","SMOKING_CURRENT","T1_BMI","VL",
+                 "CRTAM_Neurology","LY9_Inflammation","CD6_Inflammation","VAT1_Oncology") %>%
+  mutate(BMI_cat2 = case_when(T1_BMI <18.5 ~ "BMI <18.5",
+                             T1_BMI >=18.5 & T1_BMI <24.9 ~ "BMI 18.5-24.9",
+                             T1_BMI >=25 & T1_BMI <30 ~ "BMI 25-29.9",
+                             T1_BMI >=30 ~ "BMI >=30"),
+         SMOKING_CURRENT = ifelse(SMOKING_CURRENT==0,"Smoking (+)","Smoking (-)"))%>%
+  dplyr::mutate(VL_cat = case_when( NONVIREMIC=="EC" ~ "EC",
+                            NONVIREMIC=="VC" & VL < 400 ~ "50-400",
+                            NONVIREMIC=="VC" & VL >= 400 & VL < 2000 ~ "400-2000",
+                            NONVIREMIC=="VC" & VL > 2000 ~ "2000-10000")) #choose cell populations of interest
+
+# pivot longer with melt() from reshape2
+melt_data <- reshape2::melt(cocktails_df, id=c("ID", "NONVIREMIC","SMOKING_CURRENT","T1_BMI","BMI_cat2","VL","VL_cat")) 
+summary(as.factor(melt_data$variable))
+# extract protein and panel names from variable name
+melt_data <- melt_data %>%
+  mutate(Protein = stringr::str_split_i(variable,"_",1),
+         Panel = stringr::str_split_i(variable,"_",2))
+
+# make factors in the right order
+melt_data$VL_cat <- factor(melt_data$VL_cat, levels = c("EC","50-400","400-2000","2000-10000"))
+melt_data$Protein <- factor(melt_data$Protein, levels = c("CRTAM","LY9","CD6","VAT1"))
+melt_data$BMI_cat <- factor(melt_data$BMI_cat, levels = c("BMI <18.5","BMI 18.5-24.9","BMI 25-29.9", "BMI >=30" ))
+
+# double check whether the data has been correctly transformed
+# head(melt_data)
+# summary(as.factor(melt_data$Protein))
+# str(melt_data)
+```
+
+#### Redo Supplementary boxplots, stratification by BMI
+```{r}
+### Figure S2B - BMI stratification
+melt_data$BMI_cat2 <- factor(melt_data$BMI_cat2, levels = unique(melt_data$BMI_cat2)[c(5,1,2,4)])
+
+melt_data %>% 
+  filter(!is.na(BMI_cat2))%>%
+  ggplot(aes(x = BMI_cat2, y = value, fill = NONVIREMIC))+
+  #geom_violin(alpha=0.3, position = position_dodge(width = .9), size=.1, color=NA) +
+  geom_boxplot(notch = FALSE,  outlier.size = -1, width=.15, 
+               #color="black",
+               lwd=.5, position = position_dodge(width = .9),
+               alpha = 0.5,show.legend = F)+
+  geom_jitter( shape= 21, size=.5, 
+               position = position_jitterdodge(dodge.width = .9), 
+               aes(color = NONVIREMIC),alpha=.5)+
+  ylab(c("Log2 NPX"))  +
+  xlab(c(""))  +
+  facet_wrap(~Protein, scales = "free",ncol = 2)+#
+  theme_bw(base_size = 8)+
+  guides(fill = guide_legend(override.aes = list(alpha = .5,color="black")))+
+  scale_fill_manual(values=c("red3","darkgrey"))+
+  scale_color_manual(values=c( "red3","darkgrey"))+
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8, angle = 45, hjust = 1))
+
+ggsave(paste0(working_dir, "Outputs/AdditionalRebuttal_FigureS2B_Boxplot_Stratified_BMIcategory.pdf"), dpi = 300,width = 10, height = 10, units = "cm" ) 
+
+# P values
+for(protein in levels(melt_data$Protein)) {
+  for(stratum in levels(melt_data$BMI_cat2)) {
+  pval <- wilcox.test(melt_data[which(melt_data$Protein == protein &
+                                melt_data$BMI_cat2 == stratum),"value"] ~ # by EC/VC status
+              melt_data[which(melt_data$Protein == protein &
+                                melt_data$BMI_cat2 == stratum),"NONVIREMIC"])$p.value
+  print(paste(protein, stratum, pval))
+}}
+```
+#### who are the three outliers?
+Anonymized
+```{r}
+# cocktails_df %>% filter(BMI_cat2 == "BMI 18.5-24.9" & NONVIREMIC=="EC") %>% select(ID, CRTAM_Neurology, LY9_Inflammation)
+```
+
+
+
+
